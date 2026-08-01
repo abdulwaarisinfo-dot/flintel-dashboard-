@@ -2,7 +2,7 @@
 FLINTEL CRM DASHBOARD — index.py
 =================================
 Real-time, READ-ONLY monitoring dashboard for the FLINTEL signal
-intelligence system.
+intelligence system. 
 
 Connects to the EXACT SAME MongoDB database + collections the background
 service (flintel.py) already writes to:
