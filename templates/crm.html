@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FLINTEL — Signal Intake · {{ mongodb_db }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:            #0a0e13;
+    --bg-raised:     #0d1218;
+    --panel:         #11161d;
+    --panel-line:    #1e2731;
+    --hairline:      #232d38;
+    --text:          #e7edf3;
+    --text-dim:      #7c8794;
+    --text-faint:    #4b5561;
+
+    --high:          #ff5a5f;
+    --high-dim:      #532529;
+    --medium:        #f5b841;
+    --medium-dim:    #4c3d1c;
+    --low:           #3e4b59;
+    --low-dim:       #232d38;
+
+    --live:          #43e6a0;
+    --live-dim:      #163229;
+    --rescore:       #7aa2ff;
+
+    --font-display:  'Space Grotesk', sans-serif;
+    --font-mono:      'IBM Plex Mono', monospace;
+
+    --radius: 3px;
+  }
+
+  *{ box-sizing:border-box; margin:0; padding:0; }
+
+  html, body{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    min-height:100vh;
+  }
+
+  body{
+    background-image:
+      radial-gradient(ellipse 900px 500px at 15% -10%, rgba(67,230,160,0.05), transparent 60%),
+      radial-gradient(ellipse 700px 400px at 100% 0%, rgba(122,162,255,0.04), transparent 60%);
+  }
+
+  ::selection{ background: var(--live-dim); color: var(--live); }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+
+  a:focus-visible, button:focus-visible{
+    outline: 2px solid var(--live);
+    outline-offset: 2px;
+  }
+
+  /* ───────────────────────── HEADER ───────────────────────── */
+
+  .topbar{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 24px;
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--hairline);
+    background: linear-gradient(180deg, var(--bg-raised), var(--bg));
+    flex-wrap: wrap;
+  }
+
+  .brand{
+    display:flex;
+    align-items:baseline;
+    gap: 14px;
+  }
+
+  .brand h1{
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 20px;
+    letter-spacing: 0.14em;
+  }
+
+  .brand .sub{
+    font-size: 11.5px;
+    color: var(--text-dim);
+    letter-spacing: 0.03em;
+  }
+
+  .status-cluster{
+    display:flex;
+    align-items:center;
+    gap: 22px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+
+  .status-item{
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    white-space: nowrap;
+  }
+
+  .status-item .val{ color: var(--text); font-weight: 500; }
+
+  .dot{
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--text-faint);
+    flex-shrink: 0;
+  }
+  .dot.online{
+    background: var(--live);
+    box-shadow: 0 0 0 0 rgba(67,230,160,0.55);
+    animation: pulse-dot 2.2s ease-out infinite;
+  }
+  .dot.offline{ background: var(--high); }
+
+  @keyframes pulse-dot{
+    0%   { box-shadow: 0 0 0 0 rgba(67,230,160,0.45); }
+    70%  { box-shadow: 0 0 0 8px rgba(67,230,160,0); }
+    100% { box-shadow: 0 0 0 0 rgba(67,230,160,0); }
+  }
+
+  .legend{
+    display:flex;
+    gap: 14px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    padding: 8px 28px;
+    border-bottom: 1px solid var(--hairline);
+    letter-spacing: 0.02em;
+  }
+  .legend .chip{ display:flex; align-items:center; gap:6px; }
+  .legend .swatch{ width:9px; height:9px; border-radius:2px; }
+  .legend .swatch.high{ background: var(--high); }
+  .legend .swatch.medium{ background: var(--medium); }
+  .legend .swatch.low{ background: var(--low); }
+
+  /* ─────────────────── INDUSTRY BREAKDOWN (NEW) ─────────────────── */
+
+  .industries-panel{
+    padding: 16px 28px 18px;
+    border-bottom: 1px solid var(--hairline);
+    background: var(--bg-raised);
+  }
+
+  .industries-head{
+    display:flex;
+    align-items:center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .industries-head .row-label{
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+  }
+
+  .busiest-badge{
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    padding: 4px 10px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--panel);
+  }
+  .busiest-badge .dot{ background: var(--live); box-shadow:none; animation:none; }
+  .busiest-badge .busiest-val{
+    color: var(--text);
+    font-weight: 600;
+    font-family: var(--font-display);
+    letter-spacing: 0.02em;
+  }
+  .busiest-badge .busiest-count{
+    color: var(--live);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .industries-grid{
+    display:grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px 24px;
+  }
+
+  @media (max-width: 980px){
+    .industries-grid{ grid-template-columns: 1fr; }
+  }
+
+  .industry-row{
+    display:grid;
+    grid-template-columns: 148px 1fr 44px;
+    align-items:center;
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: background 200ms ease, border-color 200ms ease;
+  }
+
+  .industry-row .industry-label{
+    font-size: 11.5px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .industry-row .industry-bar-track{
+    height: 6px;
+    background: var(--panel-line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .industry-row .industry-bar-fill{
+    height: 100%;
+    width: 0%;
+    background: var(--rescore);
+    transition: width 400ms cubic-bezier(.4,0,.2,1);
+  }
+
+  .industry-row .industry-count{
+    font-size: 12.5px;
+    text-align: right;
+    color: var(--text);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .industry-row.is-busiest{
+    background: var(--live-dim);
+    border-color: rgba(67,230,160,0.3);
+  }
+  .industry-row.is-busiest .industry-label{ color: var(--text); font-weight: 600; }
+  .industry-row.is-busiest .industry-bar-fill{ background: var(--live); }
+  .industry-row.is-busiest .industry-count{ color: var(--live); }
+
+  .other-breakdown-wrap{
+    grid-column: 1 / -1;
+    margin-top: 2px;
+    padding: 2px 8px 4px;
+  }
+  .other-breakdown-label{
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-faint);
+    margin-bottom: 6px;
+  }
+  .other-breakdown-chips{
+    display:flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .other-chip{
+    display:flex;
+    align-items:center;
+    gap: 6px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 3px 8px;
+    max-width: 260px;
+  }
+  .other-chip .other-chip-value{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .other-chip .other-chip-count{
+    color: var(--text);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+  .other-breakdown-empty{
+    font-size: 10.5px;
+    color: var(--text-faint);
+  }
+
+  /* ───────────────────────── LANES ───────────────────────── */
+
+  .lanes{
+    display:grid;
+    grid-template-columns: repeat({{ platforms|length }}, 1fr);
+    min-height: 0;
+  }
+
+  @media (max-width: 980px){
+    .lanes{ grid-template-columns: 1fr; }
+    .lane{ border-bottom: 1px solid var(--hairline); }
+    .lane + .lane{ border-left:none; }
+  }
+
+  .lane{
+    border-left: 1px solid var(--hairline);
+    display:flex;
+    flex-direction:column;
+    background: var(--panel);
+    position: relative;
+    min-width: 0;
+  }
+  .lane:first-child{ border-left:none; }
+
+  /* idle trace: a quiet ambient heartbeat baseline per lane */
+  .trace{
+    height: 26px;
+    border-bottom: 1px solid var(--hairline);
+    position:relative;
+    overflow:hidden;
+    background:
+      linear-gradient(90deg, transparent 0%, transparent 100%);
+  }
+  .trace svg{ width:100%; height:100%; display:block; }
+  .trace path{
+    fill:none;
+    stroke: var(--text-faint);
+    stroke-width: 1.2;
+    opacity: 0.55;
+  }
+  .trace.flash-insert path{ stroke: var(--live); opacity: 1; animation: trace-flash 900ms ease-out; }
+  .trace.flash-rescore path{ stroke: var(--rescore); opacity: 1; animation: trace-flash 900ms ease-out; }
+
+  @keyframes trace-flash{
+    0%   { stroke-width: 1.2; }
+    25%  { stroke-width: 2.4; }
+    100% { stroke-width: 1.2; }
+  }
+
+  .lane-head{
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .platform-name{
+    font-family: var(--font-display);
+    font-size: 14.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .lane-count-row{
+    display:flex;
+    align-items:baseline;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .lane-count{
+    font-size: 30px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    transition: color 200ms ease;
+  }
+  .lane-count.bump{ color: var(--live); }
+
+  .lane-count-label{
+    font-size: 10.5px;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
+  }
+
+  .avg-row{
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .avg-row .avg-val{ color: var(--text); font-weight:500; }
+
+  /* distribution bar */
+  .dist{
+    padding: 14px 18px 16px;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .dist-bar{
+    display:flex;
+    height: 8px;
+    border-radius: var(--radius);
+    overflow:hidden;
+    background: var(--panel-line);
+  }
+  .dist-bar .seg{ transition: width 400ms cubic-bezier(.4,0,.2,1); }
+  .dist-bar .seg.high{ background: var(--high); }
+  .dist-bar .seg.medium{ background: var(--medium); }
+  .dist-bar .seg.low{ background: var(--low); }
+
+  .dist-nums{
+    display:flex;
+    justify-content: space-between;
+    margin-top: 10px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+  }
+  .dist-nums span b{ color: var(--text); font-weight: 500; }
+
+  /* batch progress */
+  .batch{
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--hairline);
+    flex: 1;
+  }
+
+  .row-label{
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+    margin-bottom: 8px;
+  }
+
+  .progress-track{
+    height: 5px;
+    background: var(--panel-line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+  .progress-fill{
+    height: 100%;
+    background: var(--live);
+    transition: width 400ms ease;
+  }
+  .progress-fill.time{ background: var(--rescore); }
+
+  .progress-caption{
+    display:flex;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+  .progress-caption b{ color: var(--text); font-weight:500; }
+
+  .backlog{
+    display:flex;
+    justify-content: space-between;
+    align-items:center;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    padding-top: 4px;
+  }
+  .backlog b{
+    font-size: 15px;
+    color: var(--text);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ───────────────────────── FOOTER: RESCORE ───────────────────────── */
+
+  .footer{
+    display:flex;
+    align-items:center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 14px 28px;
+    border-top: 1px solid var(--hairline);
+    background: var(--bg-raised);
+    flex-wrap: wrap;
+  }
+
+  .footer-title{
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+
+  .rescore-stats{
+    display:flex;
+    gap: 28px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .rescore-stats .num{
+    font-size: 16px;
+    color: var(--text);
+    font-weight:500;
+    font-variant-numeric: tabular-nums;
+    margin-right: 6px;
+  }
+  .rescore-stats .num.pending{ color: var(--medium); }
+  .rescore-stats .num.processing{ color: var(--rescore); }
+</style>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <h1>FLINTEL</h1>
+      <span class="sub">signal intake · {{ mongodb_db }}</span>
+    </div>
+    <div class="status-cluster">
+      <div class="status-item"><span class="dot offline" id="ws-dot"></span><span id="ws-label">connecting</span></div>
+      <div class="status-item">mongodb <span class="val" id="mongo-status">—</span></div>
+      <div class="status-item">uptime <span class="val" id="uptime-val">—</span></div>
+      <div class="status-item">clients <span class="val" id="clients-val">—</span></div>
+    </div>
+  </header>
+
+  <div class="legend">
+    <span class="chip"><span class="swatch high"></span>high ≥ {{ min_score_high }}</span>
+    <span class="chip"><span class="swatch medium"></span>medium {{ min_score_medium }}–{{ min_score_high - 1 }}</span>
+    <span class="chip"><span class="swatch low"></span>low &lt; {{ min_score_medium }}</span>
+  </div>
+
+  <!-- ─────────────────── INDUSTRY BREAKDOWN (NEW) ───────────────────
+       Counts here come straight from index.py's `industries` /
+       `busiest_industry` data (seeded once at startup, then updated
+       live via the same `signals` change stream as the platform lanes).
+       Classification rule (enforced server-side in index.py, nothing to
+       change here): if a signal has a search_keyword-style field, ONLY
+       that value decides its industry (falls to "Other" if it doesn't
+       match, post text is never checked in that case). Only signals
+       missing that field get classified from their post text instead.
+  -->
+  {% set industry_counts_list = industries.values() | list %}
+  {% set max_industry_count = (industry_counts_list | max) if industry_counts_list else 0 %}
+  <section class="industries-panel">
+    <div class="industries-head">
+      <div class="row-label">messages by industry</div>
+      <div class="busiest-badge" id="busiest-industry-badge">
+        <span class="dot"></span>
+        <span>busiest</span>
+        <span class="busiest-val" id="busiest-industry-label">{{ busiest_industry.label if busiest_industry and busiest_industry.label else '—' }}</span>
+        <span class="busiest-count" id="busiest-industry-count">{{ ('(' ~ busiest_industry.count ~ ')') if busiest_industry and busiest_industry.label else '' }}</span>
+      </div>
+    </div>
+    <div class="industries-grid" id="industries-grid">
+      {% for key, label in industry_labels.items() %}
+      {% set cnt = industries.get(key, 0) %}
+      {% set pct = (0 if max_industry_count == 0 else (cnt / max_industry_count * 100)) %}
+      <div class="industry-row {{ 'is-busiest' if busiest_industry and busiest_industry.key == key else '' }}" id="industry-row-{{ key }}" data-industry="{{ key }}">
+        <span class="industry-label">{{ label }}</span>
+        <span class="industry-bar-track"><span class="industry-bar-fill" id="industry-bar-{{ key }}" style="width:{{ pct }}%"></span></span>
+        <span class="industry-count" id="industry-count-{{ key }}">{{ cnt }}</span>
+      </div>
+      {% if key == 'other' %}
+      <div class="other-breakdown-wrap">
+        <div class="other-breakdown-label">what's inside "other" (top raw values that didn't match an industry)</div>
+        <div class="other-breakdown-chips" id="other-breakdown-chips">
+          {% if other_breakdown %}
+            {% for item in other_breakdown %}
+            <span class="other-chip"><span class="other-chip-value">{{ item.value }}</span><span class="other-chip-count">{{ item.count }}</span></span>
+            {% endfor %}
+          {% else %}
+            <span class="other-breakdown-empty">no unmatched values yet</span>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+      {% endfor %}
+    </div>
+  </section>
+
+  <main class="lanes">
+    {% for p in platforms %}
+    {% set s = stats[p] %}
+    {% set q = queues[p] %}
+    <section class="lane" data-platform="{{ p }}">
+
+      <div class="trace" id="trace-{{ p }}">
+        <svg viewBox="0 0 200 26" preserveAspectRatio="none">
+          <path d="M0,13 L70,13 L78,4 L86,22 L94,13 L200,13"></path>
+        </svg>
+      </div>
+
+      <div class="lane-head">
+        <div class="platform-name">{{ platform_labels[p] }}</div>
+        <div class="lane-count-row">
+          <span class="lane-count" id="count-{{ p }}">{{ s.count }}</span>
+          <span class="lane-count-label">signals</span>
+        </div>
+        <div class="avg-row">avg intent <span class="avg-val" id="avg-{{ p }}">{{ s.avg_score }}</span></div>
+      </div>
+
+      <div class="dist">
+        <div class="row-label">score distribution</div>
+        <div class="dist-bar" id="distbar-{{ p }}">
+          <div class="seg high" id="seg-high-{{ p }}" style="width:0%"></div>
+          <div class="seg medium" id="seg-medium-{{ p }}" style="width:0%"></div>
+          <div class="seg low" id="seg-low-{{ p }}" style="width:0%"></div>
+        </div>
+        <div class="dist-nums">
+          <span>high <b id="num-high-{{ p }}">{{ s.high }}</b></span>
+          <span>med <b id="num-medium-{{ p }}">{{ s.medium }}</b></span>
+          <span>low <b id="num-low-{{ p }}">{{ s.low }}</b></span>
+        </div>
+      </div>
+
+      <div class="batch">
+        <div class="row-label">current batch</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="batch-fill-{{ p }}" style="width:0%"></div>
+        </div>
+        <div class="progress-caption">
+          <span>items <b id="batch-items-{{ p }}">{{ q.pending_in_batch }}</b>/{{ q.batch_size }}</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill time" id="time-fill-{{ p }}" style="width:0%"></div>
+        </div>
+        <div class="progress-caption">
+          <span>elapsed <b id="batch-elapsed-{{ p }}">{{ q.elapsed_seconds if q.elapsed_seconds is not none else '—' }}s</b>/{{ q.timeout_seconds }}s</span>
+        </div>
+        <div class="backlog">
+          <span>queue backlog</span>
+          <b id="backlog-{{ p }}">{{ q.backlog_queue }}</b>
+        </div>
+      </div>
+    </section>
+    {% endfor %}
+  </main>
+
+  <footer class="footer">
+    <div class="footer-title"><span class="dot" style="background:var(--rescore)"></span>rescore queue</div>
+    <div class="rescore-stats">
+      <span><span class="num pending" id="rescore-pending">{{ rescore.pending }}</span>pending</span>
+      <span><span class="num processing" id="rescore-processing">{{ rescore.processing }}</span>processing</span>
+    </div>
+  </footer>
+
+<script>
+(function(){
+  const PLATFORMS = {{ platforms|tojson }};
+  const MIN_MED = {{ min_score_medium }};
+  const MIN_HIGH = {{ min_score_high }};
+  const INDUSTRY_LABELS = {{ industry_labels|tojson }};
+
+  const wsDot   = document.getElementById('ws-dot');
+  const wsLabel = document.getElementById('ws-label');
+
+  function setConn(online){
+    wsDot.classList.toggle('online', online);
+    wsDot.classList.toggle('offline', !online);
+    wsLabel.textContent = online ? 'live' : 'reconnecting';
+  }
+
+  function renderStats(stats){
+    PLATFORMS.forEach(p => {
+      const s = stats[p];
+      if(!s) return;
+
+      const countEl = document.getElementById('count-' + p);
+      if(countEl && countEl.textContent !== String(s.count)){
+        countEl.textContent = s.count;
+        countEl.classList.add('bump');
+        setTimeout(() => countEl.classList.remove('bump'), 500);
+      }
+
+      const avgEl = document.getElementById('avg-' + p);
+      if(avgEl) avgEl.textContent = s.avg_score;
+
+      const total = Math.max(s.count, 1);
+      const highPct = (s.high / total) * 100;
+      const medPct  = (s.medium / total) * 100;
+      const lowPct  = (s.low / total) * 100;
+
+      const highBar = document.getElementById('seg-high-' + p);
+      const medBar  = document.getElementById('seg-medium-' + p);
+      const lowBar  = document.getElementById('seg-low-' + p);
+      if(highBar) highBar.style.width = highPct + '%';
+      if(medBar)  medBar.style.width  = medPct + '%';
+      if(lowBar)  lowBar.style.width  = lowPct + '%';
+
+      const nh = document.getElementById('num-high-' + p);
+      const nm = document.getElementById('num-medium-' + p);
+      const nl = document.getElementById('num-low-' + p);
+      if(nh) nh.textContent = s.high;
+      if(nm) nm.textContent = s.medium;
+      if(nl) nl.textContent = s.low;
+    });
+  }
+
+  // ─────────────────── INDUSTRY BREAKDOWN (NEW) ───────────────────
+  function renderIndustries(industries, busiest){
+    if(!industries) return;
+
+    const counts = Object.values(industries);
+    const maxCount = counts.length ? Math.max(...counts) : 0;
+
+    Object.keys(INDUSTRY_LABELS).forEach(key => {
+      const cnt = industries[key] || 0;
+      const pct = maxCount === 0 ? 0 : (cnt / maxCount) * 100;
+
+      const barEl = document.getElementById('industry-bar-' + key);
+      const countEl = document.getElementById('industry-count-' + key);
+      const rowEl = document.getElementById('industry-row-' + key);
+
+      if(barEl) barEl.style.width = pct + '%';
+      if(countEl) countEl.textContent = cnt;
+      if(rowEl) rowEl.classList.toggle('is-busiest', !!busiest && busiest.key === key);
+    });
+
+    const labelEl = document.getElementById('busiest-industry-label');
+    const countLabelEl = document.getElementById('busiest-industry-count');
+    if(busiest && busiest.label){
+      if(labelEl) labelEl.textContent = busiest.label;
+      if(countLabelEl) countLabelEl.textContent = '(' + busiest.count + ')';
+    } else {
+      if(labelEl) labelEl.textContent = '—';
+      if(countLabelEl) countLabelEl.textContent = '';
+    }
+  }
+
+  // What's actually inside "Other" — rebuilt via safe DOM nodes (textContent,
+  // never innerHTML) since these values come straight from social posts.
+  function renderOtherBreakdown(items){
+    const wrap = document.getElementById('other-breakdown-chips');
+    if(!wrap) return;
+    wrap.innerHTML = '';
+
+    if(!items || items.length === 0){
+      const empty = document.createElement('span');
+      empty.className = 'other-breakdown-empty';
+      empty.textContent = 'no unmatched values yet';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    items.forEach(item => {
+      const chip = document.createElement('span');
+      chip.className = 'other-chip';
+
+      const valueEl = document.createElement('span');
+      valueEl.className = 'other-chip-value';
+      valueEl.textContent = item.value;
+
+      const countEl = document.createElement('span');
+      countEl.className = 'other-chip-count';
+      countEl.textContent = item.count;
+
+      chip.appendChild(valueEl);
+      chip.appendChild(countEl);
+      wrap.appendChild(chip);
+    });
+  }
+
+  function flashTrace(platform, kind){
+    const trace = document.getElementById('trace-' + platform);
+    if(!trace) return;
+    const cls = kind === 'rescored' ? 'flash-rescore' : 'flash-insert';
+    trace.classList.remove('flash-insert', 'flash-rescore');
+    // force reflow so the animation restarts on rapid repeated events
+    void trace.offsetWidth;
+    trace.classList.add(cls);
+    setTimeout(() => trace.classList.remove(cls), 900);
+  }
+
+  function renderQueues(queues, rescore){
+    PLATFORMS.forEach(p => {
+      const q = queues[p];
+      if(!q) return;
+
+      const batchFill = document.getElementById('batch-fill-' + p);
+      const batchItems = document.getElementById('batch-items-' + p);
+      if(batchFill) batchFill.style.width = Math.min(100, (q.pending_in_batch / q.batch_size) * 100) + '%';
+      if(batchItems) batchItems.textContent = q.pending_in_batch;
+
+      const timeFill = document.getElementById('time-fill-' + p);
+      const elapsedEl = document.getElementById('batch-elapsed-' + p);
+      if(q.elapsed_seconds !== null && q.elapsed_seconds !== undefined){
+        if(timeFill) timeFill.style.width = Math.min(100, (q.elapsed_seconds / q.timeout_seconds) * 100) + '%';
+        if(elapsedEl) elapsedEl.textContent = q.elapsed_seconds + 's';
+      } else {
+        if(timeFill) timeFill.style.width = '0%';
+        if(elapsedEl) elapsedEl.textContent = '—';
+      }
+
+      const backlogEl = document.getElementById('backlog-' + p);
+      if(backlogEl) backlogEl.textContent = q.backlog_queue;
+    });
+
+    if(rescore){
+      const rp = document.getElementById('rescore-pending');
+      const rc = document.getElementById('rescore-processing');
+      if(rp) rp.textContent = rescore.pending;
+      if(rc) rc.textContent = rescore.processing;
+    }
+  }
+
+  function connect(){
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/ws/live');
+
+    ws.onopen = () => setConn(true);
+    ws.onclose = () => { setConn(false); setTimeout(connect, 2000); };
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = (evt) => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch(e) { return; }
+
+      if(msg.type === 'stats'){
+        renderStats(msg.data);
+        if(msg.industries){
+          renderIndustries(msg.industries, msg.busiest_industry);
+        }
+        if(msg.other_breakdown){
+          renderOtherBreakdown(msg.other_breakdown);
+        }
+        if(msg.event && msg.event.platform){
+          flashTrace(msg.event.platform, msg.event.kind);
+        }
+      } else if(msg.type === 'queues'){
+        renderQueues(msg.data, msg.rescore);
+      }
+    };
+
+    // keep-alive ping so proxies don't idle-timeout the socket
+    const ping = setInterval(() => {
+      if(ws.readyState === WebSocket.OPEN) ws.send('ping');
+      else clearInterval(ping);
+    }, 20000);
+  }
+
+  async function pollHealth(){
+    try{
+      const res = await fetch('/api/health');
+      const data = await res.json();
+      const mongoEl = document.getElementById('mongo-status');
+      const uptimeEl = document.getElementById('uptime-val');
+      const clientsEl = document.getElementById('clients-val');
+      if(mongoEl) mongoEl.textContent = data.mongodb;
+      if(clientsEl) clientsEl.textContent = data.clients_live;
+      if(uptimeEl){
+        const s = data.uptime_seconds;
+        const h = String(Math.floor(s / 3600)).padStart(2, '0');
+        const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+        const sec = String(s % 60).padStart(2, '0');
+        uptimeEl.textContent = h + ':' + m + ':' + sec;
+      }
+    } catch(e){ /* health check failed silently, ws status already shown */ }
+  }
+
+  connect();
+  pollHealth();
+  setInterval(pollHealth, 10000);
+})();
+</script>
+
+</body>
+</html>
