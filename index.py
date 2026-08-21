@@ -278,6 +278,53 @@ INDUSTRIES = {
     "diversifying payment processors", "risk of losing payment processor",
     "worried about getting cut off by stripe", "worried about account termination",
     
+        "deal at risk", "relationship at risk",
+    "can't wait any longer", "running out of time", "no more time",
+
+    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
+    "just signed a supplier", "signed a new supplier", "found a supplier",
+    "new supplier in", "signed a contract with", "new contract with",
+    "starting to import", "starting an import", "starting to export",
+    "starting an export", "launching in", "expanding to",
+    "entering the market", "new market", "setting up payments",
+    "need to set up payments", "need to transfer money",
+    "will need to send", "will need to transfer", "going to need",
+    "starting a business", "new business", "import business",
+    "export business", "trading company", "sourcing products from",
+    "sourcing goods from", "buying products from", "buying goods from",
+    "manufacturing in", "producing in",
+
+    # ── TREASURY & FX ────────────────────────────────────────────────────────
+    "treasury management", "cash management", "liquidity management",
+    "FX management", "FX exposure", "FX risk", "FX hedging",
+    "currency hedging", "currency risk", "currency exposure",
+    "FX solution", "FX platform", "FX tool",
+    "treasury solution", "treasury platform", "cash flow management",
+    "multi currency", "multi-currency", "multicurrency",
+    "currency account", "foreign currency account",
+    "international banking", "international bank account",
+    "global banking", "global bank account", "correspondent banking",
+    "banking relationship", "banking partner",
+    "payment infrastructure", "payment rails", "payment solution",
+    "payment platform", "payment provider", "payment partner",
+    "fintech payment", "embedded payment", "embedded finance",
+    "cross border banking", "international banking solution",
+    "FX banking", "FX banking relationship", "FX liquidity",
+    "cash pooling", "cash concentration",
+    "intercompany payment", "intercompany transfer",
+
+    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
+    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
+    "FX trader", "treasury director", "head of treasury", "VP treasury",
+    "international payments manager", "global payments manager",
+    "cross border payments", "payments operations manager",
+    "payments specialist", "treasury specialist", "FX specialist",
+    "international finance manager", "global finance manager",
+    "head of payments", "director of payments", "VP payments",
+    "chief financial officer", "head of finance", "finance director",
+    "controller international", "global controller",
+    
+    
         ],
     },
     "cybersecurity": {
