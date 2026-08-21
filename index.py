@@ -324,7 +324,6 @@ INDUSTRIES = {
     "chief financial officer", "head of finance", "finance director",
     "controller international", "global controller",
     
-    
         ],
     },
     "cybersecurity": {
