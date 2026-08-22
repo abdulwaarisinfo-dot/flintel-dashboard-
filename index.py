@@ -214,7 +214,7 @@ INDUSTRIES = {
     "alternative to stripe", "switching from stripe", "leaving stripe",
     "moving off stripe", "migrating from stripe", "replacing stripe",
     "ditching stripe", "fed up with stripe", "done with stripe",
-    "better than stripe", "cheaper than stripe", "instead of stripe", "wire failed",
+    "better than stripe", "cheaper than stripe", "instead of stripe", "wire failed", "compliance review", "compliance check",
 
     # ── OTHER PROCESSOR/PSP PAIN (generalized, not per-platform spam) ───────
     "PayPal froze my funds", "PayPal held my funds", "PayPal banned my account",
