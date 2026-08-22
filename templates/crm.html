@@ -290,10 +290,12 @@
     border: 1px solid var(--hairline);
     border-radius: var(--radius);
     padding: 3px 8px;
+    max-width: 100%;
   }
   .other-chip .other-chip-value{
     white-space: normal;
     overflow-wrap: anywhere;
+    word-break: break-word;
   }
   .other-chip .other-chip-count{
     color: var(--text);
@@ -685,6 +687,35 @@
     text-align: right;
   }
 
+  .details-item-top{
+    display:flex;
+    justify-content: flex-end;
+    margin-bottom: 8px;
+  }
+
+  .details-post-link{
+    display:inline-flex;
+    align-items:center;
+    gap: 6px;
+    font-size: 10.5px;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    color: var(--rescore);
+    background: rgba(122,162,255,0.08);
+    border: 1px solid rgba(122,162,255,0.35);
+    border-radius: var(--radius);
+    padding: 5px 10px;
+    text-decoration: none;
+    letter-spacing: 0.02em;
+    transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  .details-post-link:hover{
+    background: rgba(122,162,255,0.2);
+    border-color: rgba(122,162,255,0.6);
+    color: var(--text);
+  }
+  .details-post-link:visited{ color: var(--rescore); }
+
   .details-item-head{
     display:flex;
     align-items:center;
@@ -827,7 +858,7 @@
         <div class="other-breakdown-chips" id="other-breakdown-chips">
           {% if other_breakdown %}
             {% for item in other_breakdown %}
-            <span class="other-chip"><span class="other-chip-value">{{ item.value }}</span><span class="other-chip-count">{{ item.count }}</span></span>
+            <span class="other-chip"><span class="other-chip-value" title="{{ item.value }}">{{ item.value }}</span><span class="other-chip-count">{{ item.count }}</span></span>
             {% endfor %}
           {% else %}
             <span class="other-breakdown-empty">no unmatched values yet</span>
@@ -1011,6 +1042,8 @@
 
   // What's actually inside "Other" — rebuilt via safe DOM nodes (textContent,
   // never innerHTML) since these values come straight from social posts.
+  // Full value is always shown in full (no client-side truncation) and is
+  // also placed in the title attribute so a hover reveals it too.
   function renderOtherBreakdown(items){
     const wrap = document.getElementById('other-breakdown-chips');
     if(!wrap) return;
@@ -1031,6 +1064,7 @@
       const valueEl = document.createElement('span');
       valueEl.className = 'other-chip-value';
       valueEl.textContent = item.value;
+      valueEl.title = item.value;
 
       const countEl = document.createElement('span');
       countEl.className = 'other-chip-count';
@@ -1196,6 +1230,23 @@
     return null;
   }
 
+  // Looks for a usable link back to the original post across the common
+  // field names different scrapers/platforms use for this.
+  function findPostUrl(doc){
+    const fields = [
+      'post_url', 'url', 'link', 'permalink', 'source_url',
+      'original_url', 'post_link', 'href'
+    ];
+    for(const f of fields){
+      const v = doc[f];
+      if(v !== undefined && v !== null && String(v).trim() !== ''){
+        const s = String(v).trim();
+        if(/^https?:\/\//i.test(s)) return s;
+      }
+    }
+    return null;
+  }
+
   function renderPasswordStep(industryKey, industryLabel, errorMsg){
     modalTitle.textContent = industryLabel;
     modalCard.classList.remove('wide');
@@ -1285,6 +1336,24 @@
       item.appendChild(seq);
 
       const right = document.createElement('div');
+
+      // Post URL CTA — sits above everything else in the card so it's
+      // the first thing visible for each message, when a link is found.
+      const postUrl = findPostUrl(doc);
+      if(postUrl){
+        const top = document.createElement('div');
+        top.className = 'details-item-top';
+
+        const link = document.createElement('a');
+        link.className = 'details-post-link';
+        link.href = postUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = 'Post URL ↗';
+
+        top.appendChild(link);
+        right.appendChild(top);
+      }
 
       const head = document.createElement('div');
       head.className = 'details-item-head';
