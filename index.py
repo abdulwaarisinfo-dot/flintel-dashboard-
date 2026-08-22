@@ -5365,7 +5365,7 @@ def classify_industry(doc: dict) -> str:
 # brand-new distinct values are folded into an "(others)" catch-all entry
 # instead of being dropped silently.
 OTHER_BREAKDOWN_MAX_DISTINCT_VALUES = int(os.getenv("OTHER_BREAKDOWN_MAX_DISTINCT_VALUES", "300"))
-OTHER_BREAKDOWN_MAX_VALUE_LENGTH    = int(os.getenv("OTHER_BREAKDOWN_MAX_VALUE_LENGTH", "80"))
+OTHER_BREAKDOWN_MAX_VALUE_LENGTH    = int(os.getenv("OTHER_BREAKDOWN_MAX_VALUE_LENGTH", "300"))
 OTHER_BREAKDOWN_TOP_N               = int(os.getenv("OTHER_BREAKDOWN_TOP_N", "10"))
 OTHER_BREAKDOWN_OVERFLOW_LABEL      = "(other distinct values)"
 
