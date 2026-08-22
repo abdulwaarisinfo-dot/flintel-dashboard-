@@ -691,7 +691,7 @@ INDUSTRIES = {
     "RevOps manager", "revenue operations manager", "CRM administrator",
     "Salesforce administrator", "Salesforce admin", "Salesforce developer",
     "sales enablement manager", "director of sales operations",
-    "chief revenue officer", "CRO", "sales operations analyst",
+    "chief revenue officer", "CRO", "sales operations analyst", "LinkedIn automation for founders" , "Creating product descriptions"
     
         ],
     },
@@ -1170,8 +1170,9 @@ INDUSTRIES = {
     "chief financial officer", "CFO", "finance manager", "accounting manager",
     "bookkeeper", "staff accountant", "senior accountant",
     "accounts payable manager", "accounts receivable manager",
-    "financial analyst", "FP&A manager",
-    
+    "financial analyst", "FP&A manager", "RPM software integration device API",
+    "LinkedIn post generator" , "free store health check audit", "Philips Remote Patient Monitoring"
+
         ],
     },
     "ai_agents": {
