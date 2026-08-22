@@ -189,7 +189,7 @@ INDUSTRIES = {
               "cross-border", "cross border", "cross border payment", "cross-border payments", "bank froze my", "transaction blocked",
             "payment", "payments", "payment gateway", "payment processor", "payment processing",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",
-            "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate",
+            "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate", "transfer failed",
             "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer",
             "iban", "swift", "stripe", "paypal", "wise transfer", "revolut", "adyen", "plaid",
             "square payments", "venmo", "cash app", "zelle", "banking", "bank transfer",
