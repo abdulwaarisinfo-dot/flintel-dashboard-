@@ -442,7 +442,7 @@ INDUSTRIES = {
              "breach", "data breach", "security breach", "cyberattack", "cyber attack",
             "hacked", "hacking", "vulnerability", "vulnerable", "malware", "ransomware",
             "ransomware attack", "phishing", "phishing attack", "firewall", "pentest",
-            "penetration test", "penetration testing", "soc2", "soc 2", "soc analyst",
+            "penetration test", "penetration testing", "soc2", "soc 2", "soc analyst", "Buffer",
             "compliance audit", "security audit", "security compliance", "data leak",
             "leaked credentials", "credential stuffing", "zero-day", "zero day",
             "endpoint security", "endpoint detection", "edr", "xdr", "siem",
