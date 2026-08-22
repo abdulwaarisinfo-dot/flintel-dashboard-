@@ -219,7 +219,7 @@ INDUSTRIES = {
     # ── OTHER PROCESSOR/PSP PAIN (generalized, not per-platform spam) ───────
     "PayPal froze my funds", "PayPal held my funds", "PayPal banned my account",
     "PayPal high fees", "PayPal chargeback problems", "PayPal terrible support", "transfer taking forever",
-            "days to process",
+            "days to process", "losing money on fees", "highway robbery",
     "Square froze my funds", "Square held my funds", "Square account closed",
     "Adyen froze my funds", "Checkout.com froze my funds",
     "Wise froze my funds", "Wise account closed", "Revolut froze my funds",
