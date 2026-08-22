@@ -248,6 +248,21 @@
   .industry-row.is-busiest .industry-bar-fill{ background: var(--live); }
   .industry-row.is-busiest .industry-count{ color: var(--live); }
 
+  /* Details affordance — deliberately quiet so the default look is
+     pixel-identical to before; only hover/focus reveals it's clickable. */
+  .industry-row.has-details{ cursor: pointer; }
+  .industry-row.has-details:hover{
+    background: var(--panel-line);
+    border-color: var(--hairline);
+  }
+  .industry-row.has-details:hover .industry-count{
+    color: var(--rescore);
+    text-decoration: underline;
+    text-decoration-color: rgba(122,162,255,0.5);
+    text-underline-offset: 2px;
+  }
+  .industry-row.is-busiest.has-details:hover .industry-count{ color: var(--live); }
+
   .other-breakdown-wrap{
     grid-column: 1 / -1;
     margin-top: 2px;
@@ -498,6 +513,250 @@
   }
   .rescore-stats .num.pending{ color: var(--medium); }
   .rescore-stats .num.processing{ color: var(--rescore); }
+
+  /* ─────────────────── DETAILS MODAL (NEW) ───────────────────
+     Only appears on demand (industry-row click). Styled with the
+     exact same tokens/fonts as the rest of the dashboard so it never
+     reads as a bolted-on component. */
+
+  .modal-overlay{
+    position: fixed;
+    inset: 0;
+    background: rgba(5,7,10,0.72);
+    backdrop-filter: blur(2px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 24px;
+  }
+  .modal-overlay.open{ display:flex; }
+
+  .modal-card{
+    width: 100%;
+    max-width: 640px;
+    max-height: 82vh;
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    display:flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .modal-card.wide{ max-width: 760px; }
+
+  .modal-head{
+    display:flex;
+    align-items:center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--hairline);
+    background: var(--bg-raised);
+  }
+
+  .modal-head-title{
+    display:flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .modal-head-title .modal-eyebrow{
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+  }
+  .modal-head-title .modal-title{
+    font-family: var(--font-display);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow:hidden;
+    text-overflow: ellipsis;
+  }
+
+  .modal-close{
+    background: none;
+    border: 1px solid var(--hairline);
+    color: var(--text-dim);
+    border-radius: var(--radius);
+    width: 26px;
+    height: 26px;
+    line-height: 1;
+    font-size: 15px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color 150ms ease, border-color 150ms ease;
+  }
+  .modal-close:hover{ color: var(--text); border-color: var(--text-faint); }
+
+  .modal-body{
+    padding: 20px;
+    overflow-y: auto;
+  }
+
+  /* password step */
+  .modal-body p.hint{
+    font-size: 11.5px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+    line-height: 1.5;
+  }
+  .pw-form{
+    display:flex;
+    gap: 8px;
+  }
+  .pw-form input{
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    padding: 9px 11px;
+  }
+  .pw-form input:focus{ outline: 2px solid var(--live); outline-offset: -1px; }
+  .pw-form button{
+    background: var(--live-dim);
+    border: 1px solid rgba(67,230,160,0.35);
+    color: var(--live);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    border-radius: var(--radius);
+    padding: 0 16px;
+    cursor: pointer;
+    transition: background 150ms ease;
+  }
+  .pw-form button:hover{ background: rgba(67,230,160,0.18); }
+  .pw-form button:disabled{ opacity:0.5; cursor:not-allowed; }
+
+  .modal-error{
+    margin-top: 12px;
+    font-size: 11.5px;
+    color: var(--high);
+  }
+
+  .modal-loading{
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+
+  /* details list — numbered sequence per industry */
+  .details-meta{
+    display:flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .details-meta b{ color: var(--text); font-weight:500; }
+
+  .details-list{
+    list-style: none;
+    display:flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .details-item{
+    display:grid;
+    grid-template-columns: 26px 1fr;
+    gap: 12px;
+    padding: 12px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+  }
+
+  .details-seq{
+    font-size: 11px;
+    color: var(--text-faint);
+    font-weight: 500;
+    padding-top: 1px;
+    text-align: right;
+  }
+
+  .details-item-head{
+    display:flex;
+    align-items:center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .details-badge{
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 7px;
+    border-radius: var(--radius);
+    border: 1px solid var(--hairline);
+    color: var(--text-dim);
+  }
+  .details-badge.platform{ color: var(--rescore); border-color: rgba(122,162,255,0.3); }
+  .details-badge.score-high{ color: var(--high); border-color: rgba(255,90,95,0.35); }
+  .details-badge.score-medium{ color: var(--medium); border-color: rgba(245,184,65,0.35); }
+  .details-badge.score-low{ color: var(--text-dim); }
+
+  .details-time{
+    font-size: 10px;
+    color: var(--text-faint);
+    margin-left: auto;
+  }
+
+  .details-text{
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .details-empty{
+    font-size: 12px;
+    color: var(--text-dim);
+    text-align: center;
+    padding: 30px 10px;
+  }
+
+  .details-toggle-raw{
+    margin-top: 8px;
+    background: none;
+    border: none;
+    color: var(--text-faint);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .details-toggle-raw:hover{ color: var(--text-dim); }
+
+  .details-raw{
+    display:none;
+    margin-top: 8px;
+    padding: 10px;
+    background: var(--bg);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    font-size: 10.5px;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .details-raw.open{ display:block; }
 </style>
 </head>
 <body>
@@ -530,6 +789,10 @@
        that value decides its industry (falls to "Other" if it doesn't
        match, post text is never checked in that case). Only signals
        missing that field get classified from their post text instead.
+
+       Each row is clickable: it opens a password-gated "Details" modal
+       that calls GET /api/admin/messages?industry=<key> and renders the
+       matching signals as a clean, numbered sequence (see modal JS below).
   -->
   {% set industry_counts_list = industries.values() | list %}
   {% set max_industry_count = (industry_counts_list | max) if industry_counts_list else 0 %}
@@ -547,7 +810,13 @@
       {% for key, label in industry_labels.items() %}
       {% set cnt = industries.get(key, 0) %}
       {% set pct = (0 if max_industry_count == 0 else (cnt / max_industry_count * 100)) %}
-      <div class="industry-row {{ 'is-busiest' if busiest_industry and busiest_industry.key == key else '' }}" id="industry-row-{{ key }}" data-industry="{{ key }}">
+      <div class="industry-row has-details {{ 'is-busiest' if busiest_industry and busiest_industry.key == key else '' }}"
+           id="industry-row-{{ key }}"
+           data-industry="{{ key }}"
+           data-label="{{ label }}"
+           role="button"
+           tabindex="0"
+           title="View {{ label }} messages">
         <span class="industry-label">{{ label }}</span>
         <span class="industry-bar-track"><span class="industry-bar-fill" id="industry-bar-{{ key }}" style="width:{{ pct }}%"></span></span>
         <span class="industry-count" id="industry-count-{{ key }}">{{ cnt }}</span>
@@ -635,6 +904,27 @@
       <span><span class="num processing" id="rescore-processing">{{ rescore.processing }}</span>processing</span>
     </div>
   </footer>
+
+  <!-- ─────────────────── DETAILS MODAL (NEW) ───────────────────
+       One reusable overlay. Two states rendered into #modal-body:
+       1) password step (first use in this browser session)
+       2) the numbered per-industry message sequence, from
+          GET /api/admin/messages?password=...&industry=<key>
+       Nothing here is cached to disk — the password is only kept in a
+       JS variable for the current page session and is re-asked on reload.
+  -->
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal-card" id="modal-card">
+      <div class="modal-head">
+        <div class="modal-head-title">
+          <span class="modal-eyebrow">details</span>
+          <span class="modal-title" id="modal-title">—</span>
+        </div>
+        <button class="modal-close" id="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
 
 <script>
 (function(){
@@ -852,6 +1142,282 @@
   connect();
   pollHealth();
   setInterval(pollHealth, 10000);
+
+  // ═══════════════════════════════════════════════════════════════════
+  // DETAILS MODAL — password-gated, per-industry, numbered sequence.
+  // Powered by GET /api/admin/messages (see index.py). The password is
+  // held only in memory for this page session — never written to disk
+  // or browser storage — and is re-requested on every page reload.
+  // ═══════════════════════════════════════════════════════════════════
+
+  let adminPassword = null;
+
+  const overlay   = document.getElementById('modal-overlay');
+  const modalCard  = document.getElementById('modal-card');
+  const modalTitle = document.getElementById('modal-title');
+  const modalBody  = document.getElementById('modal-body');
+  const modalClose = document.getElementById('modal-close');
+
+  function openModal(){ overlay.classList.add('open'); }
+  function closeModal(){
+    overlay.classList.remove('open');
+    modalCard.classList.remove('wide');
+  }
+
+  modalClose.addEventListener('click', closeModal);
+  overlay.addEventListener('click', (e) => { if(e.target === overlay) closeModal(); });
+  document.addEventListener('keydown', (e) => {
+    if(e.key === 'Escape' && overlay.classList.contains('open')) closeModal();
+  });
+
+  function scoreBadgeClass(score){
+    if(typeof score !== 'number') return 'score-low';
+    if(score >= MIN_HIGH) return 'score-high';
+    if(score >= MIN_MED) return 'score-medium';
+    return 'score-low';
+  }
+
+  function findMessageText(doc){
+    const fields = ['text', 'post_text', 'message', 'content', 'body', 'raw_text'];
+    for(const f of fields){
+      const v = doc[f];
+      if(v !== undefined && v !== null && String(v).trim() !== ''){
+        return String(v);
+      }
+    }
+    return '(no text field found on this document)';
+  }
+
+  function findTimestamp(doc){
+    const fields = ['created_at', 'timestamp', 'scraped_at', 'inserted_at', 'date'];
+    for(const f of fields){
+      if(doc[f]) return String(doc[f]);
+    }
+    return null;
+  }
+
+  function renderPasswordStep(industryKey, industryLabel, errorMsg){
+    modalTitle.textContent = industryLabel;
+    modalCard.classList.remove('wide');
+    modalBody.innerHTML = '';
+
+    const hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = 'Enter the admin password to view every message classified as "' + industryLabel + '".';
+    modalBody.appendChild(hint);
+
+    const form = document.createElement('form');
+    form.className = 'pw-form';
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.placeholder = 'Admin password';
+    input.autocomplete = 'current-password';
+
+    const btn = document.createElement('button');
+    btn.type = 'submit';
+    btn.textContent = 'Unlock';
+
+    form.appendChild(input);
+    form.appendChild(btn);
+    modalBody.appendChild(form);
+
+    if(errorMsg){
+      const err = document.createElement('div');
+      err.className = 'modal-error';
+      err.textContent = errorMsg;
+      modalBody.appendChild(err);
+    }
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const val = input.value.trim();
+      if(!val) return;
+      btn.disabled = true;
+      adminPassword = val;
+      loadIndustryDetails(industryKey, industryLabel);
+    });
+
+    setTimeout(() => input.focus(), 30);
+  }
+
+  function renderLoading(industryLabel){
+    modalTitle.textContent = industryLabel;
+    modalBody.innerHTML = '';
+    const loading = document.createElement('div');
+    loading.className = 'modal-loading';
+    loading.textContent = 'Loading messages…';
+    modalBody.appendChild(loading);
+  }
+
+  function renderDetailsList(industryLabel, payload){
+    modalCard.classList.add('wide');
+    modalTitle.textContent = industryLabel + ' — ' + payload.count + ' message' + (payload.count === 1 ? '' : 's');
+    modalBody.innerHTML = '';
+
+    const meta = document.createElement('div');
+    meta.className = 'details-meta';
+    meta.innerHTML =
+      '<span>showing <b>' + payload.count + '</b></span>' +
+      '<span>scanned <b>' + payload.scanned + '</b></span>' +
+      (payload.filters && payload.filters.platform ? '<span>platform <b>' + payload.filters.platform + '</b></span>' : '');
+    modalBody.appendChild(meta);
+
+    if(!payload.messages || payload.messages.length === 0){
+      const empty = document.createElement('div');
+      empty.className = 'details-empty';
+      empty.textContent = 'No messages found for this industry yet.';
+      modalBody.appendChild(empty);
+      return;
+    }
+
+    const list = document.createElement('ol');
+    list.className = 'details-list';
+    list.style.listStyle = 'none';
+
+    payload.messages.forEach((doc, idx) => {
+      const item = document.createElement('li');
+      item.className = 'details-item';
+
+      const seq = document.createElement('div');
+      seq.className = 'details-seq';
+      seq.textContent = String(idx + 1).padStart(2, '0');
+      item.appendChild(seq);
+
+      const right = document.createElement('div');
+
+      const head = document.createElement('div');
+      head.className = 'details-item-head';
+
+      if(doc.platform){
+        const platBadge = document.createElement('span');
+        platBadge.className = 'details-badge platform';
+        platBadge.textContent = doc.platform;
+        head.appendChild(platBadge);
+      }
+
+      if(typeof doc.intent_score === 'number'){
+        const scoreBadge = document.createElement('span');
+        scoreBadge.className = 'details-badge ' + scoreBadgeClass(doc.intent_score);
+        scoreBadge.textContent = 'intent ' + doc.intent_score;
+        head.appendChild(scoreBadge);
+      }
+
+      const ts = findTimestamp(doc);
+      if(ts){
+        const timeEl = document.createElement('span');
+        timeEl.className = 'details-time';
+        timeEl.textContent = ts;
+        head.appendChild(timeEl);
+      }
+
+      right.appendChild(head);
+
+      const textEl = document.createElement('div');
+      textEl.className = 'details-text';
+      textEl.textContent = findMessageText(doc);
+      right.appendChild(textEl);
+
+      const toggle = document.createElement('button');
+      toggle.className = 'details-toggle-raw';
+      toggle.type = 'button';
+      toggle.textContent = 'view raw document';
+
+      const raw = document.createElement('pre');
+      raw.className = 'details-raw';
+      raw.textContent = JSON.stringify(doc, null, 2);
+
+      toggle.addEventListener('click', () => {
+        const isOpen = raw.classList.toggle('open');
+        toggle.textContent = isOpen ? 'hide raw document' : 'view raw document';
+      });
+
+      right.appendChild(toggle);
+      right.appendChild(raw);
+
+      item.appendChild(right);
+      list.appendChild(item);
+    });
+
+    modalBody.appendChild(list);
+  }
+
+  function renderFetchError(industryKey, industryLabel, message){
+    // 401 (bad password) sends the person back to the password step;
+    // anything else just shows the error alongside a retry button.
+    modalCard.classList.remove('wide');
+    modalTitle.textContent = industryLabel;
+    modalBody.innerHTML = '';
+    const err = document.createElement('div');
+    err.className = 'modal-error';
+    err.style.marginTop = '0';
+    err.textContent = message;
+    modalBody.appendChild(err);
+
+    const retryForm = document.createElement('div');
+    retryForm.style.marginTop = '14px';
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'details-toggle-raw';
+    retryBtn.type = 'button';
+    retryBtn.textContent = 'try again';
+    retryBtn.addEventListener('click', () => {
+      adminPassword = null;
+      renderPasswordStep(industryKey, industryLabel, null);
+    });
+    retryForm.appendChild(retryBtn);
+    modalBody.appendChild(retryForm);
+  }
+
+  async function loadIndustryDetails(industryKey, industryLabel){
+    renderLoading(industryLabel);
+    try{
+      const url = '/api/admin/messages?password=' + encodeURIComponent(adminPassword) +
+                  '&industry=' + encodeURIComponent(industryKey) +
+                  '&limit=200';
+      const res = await fetch(url);
+
+      if(res.status === 401){
+        adminPassword = null;
+        renderPasswordStep(industryKey, industryLabel, 'Invalid password — try again.');
+        return;
+      }
+      if(res.status === 503){
+        renderFetchError(industryKey, industryLabel, 'ADMIN_PASSWORD is not configured on the server (.env).');
+        return;
+      }
+      if(!res.ok){
+        renderFetchError(industryKey, industryLabel, 'Request failed (' + res.status + ').');
+        return;
+      }
+
+      const payload = await res.json();
+      renderDetailsList(industryLabel, payload);
+    } catch(e){
+      renderFetchError(industryKey, industryLabel, 'Network error while loading messages.');
+    }
+  }
+
+  function openIndustryDetails(industryKey, industryLabel){
+    openModal();
+    if(adminPassword){
+      loadIndustryDetails(industryKey, industryLabel);
+    } else {
+      renderPasswordStep(industryKey, industryLabel, null);
+    }
+  }
+
+  document.querySelectorAll('.industry-row.has-details').forEach(row => {
+    const key = row.getAttribute('data-industry');
+    const label = row.getAttribute('data-label') || INDUSTRY_LABELS[key] || key;
+
+    row.addEventListener('click', () => openIndustryDetails(key, label));
+    row.addEventListener('keydown', (e) => {
+      if(e.key === 'Enter' || e.key === ' '){
+        e.preventDefault();
+        openIndustryDetails(key, label);
+      }
+    });
+  });
 })();
 </script>
 
