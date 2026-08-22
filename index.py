@@ -208,7 +208,7 @@ INDUSTRIES = {
     "stripe account closed", "stripe account frozen", "stripe rejected my business",
     "stripe withheld my payout", "stripe payout delayed",
     "stripe high fees", "stripe hidden fees", "why is stripe so expensive",
-    "stripe terrible support", "stripe chargeback problems",
+    "stripe terrible support", "stripe chargeback problems", "money disappeared", "no tracking",
     "stripe too many chargebacks", "stripe withdrawal issues",
     "stripe funds stuck", "stripe down", "stripe problems",
     "alternative to stripe", "switching from stripe", "leaving stripe",
