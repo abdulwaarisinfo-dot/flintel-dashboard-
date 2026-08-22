@@ -680,7 +680,7 @@ INDUSTRIES = {
     "CRM API limitations", "CRM lacks integrations",
 
     # ── URGENCY / EXPANSION SIGNALS ───────────────────────────────────────────
-    "urgently need a CRM", "need a CRM ASAP", "need this set up quickly",
+    "urgently need a CRM", "need a CRM ASAP", "need this set up quickly", "Copy.ai",
     "launching soon need CRM", "onboarding new sales hires",
     "just hired our first salesperson", "scaling our sales operations",
     "new sales hire needs a CRM", "board wants better reporting",
