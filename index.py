@@ -186,7 +186,7 @@ INDUSTRIES = {
         "label": "Fintech & Payments",
         "keywords": [
             
-              "cross-border", "cross border", "cross border payment", "cross-border payments",
+              "cross-border", "cross border", "cross border payment", "cross-border payments", "bank froze my", "transaction blocked",
             "payment", "payments", "payment gateway", "payment processor", "payment processing",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate",
