@@ -151,7 +151,7 @@ INDUSTRIES = {
             "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
             "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup",
             "fintech platform",
-             "stripe froze my funds", "stripe held my funds", "stripe holding my funds",
+             "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
     "stripe banned my account", "stripe suspended my account",
     "stripe account closed", "stripe account frozen", "stripe rejected my business",
     "stripe withheld my payout", "stripe payout delayed",
