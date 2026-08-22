@@ -213,7 +213,7 @@ INDUSTRIES = {
     "stripe funds stuck", "stripe down", "stripe problems",
     "alternative to stripe", "switching from stripe", "leaving stripe",
     "moving off stripe", "migrating from stripe", "replacing stripe",
-    "ditching stripe", "fed up with stripe", "done with stripe",
+    "ditching stripe", "fed up with stripe", "done with stripe", "Wise Business", "leaving Wise",
     "better than stripe", "cheaper than stripe", "instead of stripe", "wire failed", "compliance review", "compliance check",
 
     # ── OTHER PROCESSOR/PSP PAIN (generalized, not per-platform spam) ───────
