@@ -273,7 +273,7 @@ INDUSTRIES = {
     "transak froze my funds", "transak problems", "transak high fees",
     "ramp froze my funds", "ramp problems", "ramp banned my account",
     "banxa froze my funds", "banxa problems",
-    "triple-a froze my funds", "triple-a problems",
+    "triple-a froze my funds", "triple-a problems", "money hasn't arrived", "money still hasn't arrived",
     "bvnk froze my funds", "bvnk problems",
     "0xprocessing froze my funds", "0xprocessing problems",
     "opennode froze my funds", "opennode problems",
