@@ -201,7 +201,7 @@ INDUSTRIES = {
             "kyc", "aml compliance", "correspondent banking", "treasury management",
             "currency conversion", "exchange rate", "money transmitter", "payfac",
             "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
-            "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup",
+            "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup", "hidden fees", "unexpected fees",
             "fintech platform", "money held", "won't release my funds", "money hostage",
              "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
     "stripe banned my account", "stripe suspended my account",
