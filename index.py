@@ -26,13 +26,14 @@ lightly polled every 5s, since those aren't insert-only streams worth a
 change-stream subscription.
 
 ────────────────────────────────────────────────────────────────────────
-NEW: INDUSTRY CLASSIFICATION (added — everything above/below this note
-is otherwise untouched from the original script)
+INDUSTRY CLASSIFICATION (everything above/below this note is otherwise
+untouched from the original script)
 ────────────────────────────────────────────────────────────────────────
 Every signal is additionally bucketed into one of the industries shown
 in the client's category picker (Fintech & Payments, Cybersecurity,
 CRM & Sales Tools, Logistics, Recruitment & HR, Accounting Software,
-AI Agents), falling back to "Other" if nothing matches.
+AI Agents, Community Software), falling back to "Other" if nothing
+matches.
 
 Classification logic, per document:
   1. If the doc has a `search_keyword` (or `keyword` / `matched_keyword`)
@@ -50,6 +51,47 @@ This does not change the existing per-platform tally logic at all — it
 runs alongside it, using the same seed (startup aggregation replaced by
 a scan for industry purposes) and the same change-stream events.
 
+────────────────────────────────────────────────────────────────────────
+NEW — PER-INDUSTRY AVERAGE INTENT (added — everything else in this file
+is otherwise untouched)
+────────────────────────────────────────────────────────────────────────
+Alongside the existing `industry_stats` (plain message counts per
+industry, used by the public dashboard exactly as before — untouched),
+this adds a SEPARATE running tally, `industry_score_stats`, of each
+industry's own average `intent_score` (count / sum_score / avg_score).
+This is its own independent number from the per-platform averages in
+`live_stats` — the two never overwrite or feed into each other. It is
+seeded once at startup (alongside the industry count seed) and kept
+current incrementally via the same `signals` change stream, on insert
+only (a rescore changes a score but not which industry a post already
+landed in, so it does not shift which bucket the average belongs to).
+
+────────────────────────────────────────────────────────────────────────
+NEW — ADMIN-ONLY FULL MESSAGE DETAILS (added — everything else in this
+file is otherwise untouched)
+────────────────────────────────────────────────────────────────────────
+A new endpoint, GET /api/admin/messages, returns full raw signal
+documents (not just aggregated counts) as JSON, each annotated with the
+industry it was classified into. It is gated behind an ADMIN_PASSWORD
+value set in .env — every request must pass ?password=... matching that
+value, or it is rejected. This is meant to sit behind a "Details" button
+in the dashboard UI (not included in this file) that first asks for the
+admin password, then calls this endpoint to show every message behind an
+industry number, e.g. every Reddit message classified as Fintech &
+Payments.
+
+Set in your .env:
+    ADMIN_PASSWORD=your-secret-password-here
+
+────────────────────────────────────────────────────────────────────────
+NEW — KEYWORDS EMPTIED OUT
+────────────────────────────────────────────────────────────────────────
+Every industry's `keywords` list below has been intentionally emptied to
+`[]` so you can re-populate them yourself. Nothing else about the
+INDUSTRIES structure (keys, labels, ordering) has changed. Until you add
+keywords back in, every signal will fall through to "Other" (see
+classify_industry() above) — that's expected, not a bug.
+
 Run:
     pip install fastapi uvicorn "motor" python-dotenv jinja2 websockets --break-system-packages
     python index.py
@@ -58,15 +100,17 @@ Run:
 
 import os
 import re
+import hmac
 import asyncio
 import logging
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
@@ -85,6 +129,11 @@ log = logging.getLogger("flintel-crm")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
+
+# NEW — admin password gate for the full-message-details endpoint. Set this
+# in your .env as ADMIN_PASSWORD=... If it's left unset, the admin endpoint
+# refuses every request (fails closed, not open).
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 PLATFORMS = ["reddit", "twitter", "telegram", "facebook", "linkedin"]
 
@@ -110,7 +159,7 @@ MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
 MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW: INDUSTRY CLASSIFICATION CONFIG
+# INDUSTRY CLASSIFICATION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Which fields might hold the "this post was scraped for keyword X" value.
@@ -130,11 +179,14 @@ TEXT_FIELD_CANDIDATES = [
     ).split(",") if f.strip()
 ]
 
+# NOTE: every `keywords` list below has been intentionally emptied to `[]`.
+# Re-populate them yourself — nothing else about this structure has changed.
 INDUSTRIES = {
     "fintech_payments": {
         "label": "Fintech & Payments",
         "keywords": [
-            "cross-border", "cross border", "cross border payment", "cross-border payments",
+            
+              "cross-border", "cross border", "cross border payment", "cross-border payments",
             "payment", "payments", "payment gateway", "payment processor", "payment processing",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate",
@@ -378,13 +430,14 @@ INDUSTRIES = {
     "overseas wire transfer", "overseas transfer", "global payment",
     "global transfer", "b2b payment", "b2b transfer",
     "business to business payment",
-    
-        ],
+            
+            ],
     },
     "cybersecurity": {
         "label": "Cybersecurity",
         "keywords": [
-            "breach", "data breach", "security breach", "cyberattack", "cyber attack",
+            
+             "breach", "data breach", "security breach", "cyberattack", "cyber attack",
             "hacked", "hacking", "vulnerability", "vulnerable", "malware", "ransomware",
             "ransomware attack", "phishing", "phishing attack", "firewall", "pentest",
             "penetration test", "penetration testing", "soc2", "soc 2", "soc analyst",
@@ -537,13 +590,14 @@ INDUSTRIES = {
     "penetration tester", "red team lead", "blue team lead",
     "application security engineer", "cloud security engineer",
     "detection engineer", "security architect",
-    
-        ],
+            
+            ],
     },
     "crm_sales": {
         "label": "CRM & Sales Tools",
         "keywords": [
-            "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
+            
+              "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
             "crm alternative", "crm migration", "sales pipeline", "hubspot", "zoho crm",
             "pipedrive", "sales tool", "sales tools", "lead gen", "lead generation",
             "lead scoring", "lead management", "deal pipeline", "sales funnel",
@@ -692,13 +746,14 @@ INDUSTRIES = {
     "Salesforce administrator", "Salesforce admin", "Salesforce developer",
     "sales enablement manager", "director of sales operations",
     "chief revenue officer", "CRO", "sales operations analyst", "LinkedIn automation for founders" , "Creating product descriptions", "ai ad copy generator for shopify"
-    
-        ],
+            
+            ],
     },
     "logistics": {
         "label": "Logistics",
         "keywords": [
-            "shipping", "freight", "freight forwarding", "freight broker", "ltl shipping",
+            
+             "shipping", "freight", "freight forwarding", "freight broker", "ltl shipping",
             "ftl shipping", "carrier switch", "carrier", "carriers", "supply chain",
             "supply chain software", "supply chain disruption", "logistics", "logistics provider",
             "fulfillment", "order fulfillment", "warehouse", "warehouse management", "wms",
@@ -853,13 +908,14 @@ INDUSTRIES = {
     "VP supply chain", "head of logistics", "head of supply chain",
     "director of logistics", "director of supply chain",
     "chief supply chain officer", "freight broker", "logistics analyst",
-    
-        ],
+            
+            ],
     },
     "recruitment_hr": {
         "label": "Recruitment & HR",
         "keywords": [
-            "recruiter", "recruiters", "recruitment", "recruiting", "recruiting software",
+            
+              "recruiter", "recruiters", "recruitment", "recruiting", "recruiting software",
             "recruiting tool", "ats", "applicant tracking system", "applicant tracking",
             "hiring", "hiring manager", "hiring pipeline", "hr software", "hr platform",
             "hr tool", "hris", "workforce management", "workforce planning", "onboarding",
@@ -1018,13 +1074,14 @@ INDUSTRIES = {
     "HRIS manager", "compensation and benefits manager",
     "director of talent acquisition", "director of people operations",
     "technical recruiter", "corporate recruiter", "recruiting coordinator",
-    
-        ],
+            
+            ],
     },
     "accounting": {
         "label": "Accounting Software",
         "keywords": [
-            "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
+            
+             "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
             "accounting", "accounting software", "accounting platform", "accounting tool",
             "accounting firm", "cpa firm", "tax software", "tax filing", "tax preparation",
             "tax compliance", "invoice", "invoicing", "invoicing software", "billing software",
@@ -1173,10 +1230,14 @@ INDUSTRIES = {
     "financial analyst", "FP&A manager", "RPM software integration device API",
     "LinkedIn post generator" , "free store health check audit", "Philips Remote Patient Monitoring"
 
-        ],
+            
+            ],
     },
     "ai_agents": {
         "label": "AI Agents",
+        "keywords": [
+            
+              "label": "AI Agents",
         "keywords": [
              "best ai agent for startups",
     "best ai agent for small business",
@@ -4178,14 +4239,14 @@ INDUSTRIES = {
     "comparison ai lead generation agent for startups 2026",
     "comparison ai lead generation agent in 2026",
     "comparison ai lead generation agent for remote teams"
-    
+            
             ],
     },
     "community_software": {
         "label": "Community Software / Online Community Platform",
         "keywords": [
             
-                "a community software for our users for networking between members",
+             "a community software for our users for networking between members",
     "a community platform with mobile app for my business with groups and channels",
     "a simple community platform for our SaaS customers with organized discussions",
     "looking for a branded community platform for a global community that helps build stronger member relationships",
@@ -5184,7 +5245,7 @@ INDUSTRIES = {
     "a better alternative to Slack communities for our customers that supports paid memberships",
     "best community platform for a gaming community that is more focused than Slack",
     "searching for a community platform for my audience for our SaaS customers with private spaces"
-    
+            
             ],
     },
 }
@@ -5196,10 +5257,12 @@ INDUSTRY_KEYS_IN_ORDER = list(INDUSTRIES.keys()) + [OTHER_INDUSTRY_KEY]
 INDUSTRY_LABELS = {k: v["label"] for k, v in INDUSTRIES.items()}
 INDUSTRY_LABELS[OTHER_INDUSTRY_KEY] = OTHER_INDUSTRY_LABEL
 
-# NEW — precompiled, case-insensitive, WORD-BOUNDARY regex per keyword
-# (instead of raw substring search). This avoids false positives like a
-# bare "crm" keyword matching inside an unrelated word, and works fine
-# for multi-word phrases too since \b anchors on the phrase's own edges.
+# Precompiled, case-insensitive, WORD-BOUNDARY regex per keyword (instead of
+# raw substring search). This avoids false positives like a bare "crm"
+# keyword matching inside an unrelated word, and works fine for multi-word
+# phrases too since \b anchors on the phrase's own edges. With the keyword
+# lists emptied out, every industry's pattern list is simply empty until you
+# re-populate INDUSTRIES[...]["keywords"] yourself.
 _INDUSTRY_PATTERNS = {
     key: [
         (kw, re.compile(r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])", re.IGNORECASE))
@@ -5294,13 +5357,13 @@ def classify_industry(doc: dict) -> str:
     return industry
 
 
-# NEW — tally of raw values (search_keyword, or post text when the keyword
-# field is unavailable) that landed in "Other", so the dashboard can show
-# *what* is actually inside that bucket instead of just a count. Capped so
-# a very long-tail of distinct one-off values can't grow this unbounded —
-# once the cap is hit, only counts for values already being tracked keep
-# incrementing; brand-new distinct values are folded into an "(others)"
-# catch-all entry instead of being dropped silently.
+# Tally of raw values (search_keyword, or post text when the keyword field
+# is unavailable) that landed in "Other", so the dashboard can show *what*
+# is actually inside that bucket instead of just a count. Capped so a very
+# long-tail of distinct one-off values can't grow this unbounded — once the
+# cap is hit, only counts for values already being tracked keep incrementing;
+# brand-new distinct values are folded into an "(others)" catch-all entry
+# instead of being dropped silently.
 OTHER_BREAKDOWN_MAX_DISTINCT_VALUES = int(os.getenv("OTHER_BREAKDOWN_MAX_DISTINCT_VALUES", "300"))
 OTHER_BREAKDOWN_MAX_VALUE_LENGTH    = int(os.getenv("OTHER_BREAKDOWN_MAX_VALUE_LENGTH", "80"))
 OTHER_BREAKDOWN_TOP_N               = int(os.getenv("OTHER_BREAKDOWN_TOP_N", "10"))
@@ -5356,10 +5419,20 @@ live_stats: dict = {
     for p in PLATFORMS
 }
 
-# NEW: industry_stats — running tally of message counts per industry,
-# updated the same way live_stats is (seed once, then incrementally via
-# the same change stream on `signals`).
+# industry_stats — running tally of message COUNTS per industry (unchanged
+# from before), updated the same way live_stats is (seed once, then
+# incrementally via the same change stream on `signals`).
 industry_stats: dict = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
+
+# NEW — industry_score_stats: a SEPARATE running tally of each industry's
+# own average intent_score (count / sum_score / avg_score). This is its
+# own independent number — it never overwrites or feeds into live_stats
+# (per-platform averages) or industry_stats (per-industry counts), and
+# vice versa. Seeded once at startup, then updated incrementally on insert
+# via the same change stream on `signals`.
+industry_score_stats: dict = {
+    key: {"count": 0, "sum_score": 0, "avg_score": 0.0} for key in INDUSTRY_KEYS_IN_ORDER
+}
 
 connected_sockets: set = set()
 started_at = datetime.now(timezone.utc)
@@ -5378,8 +5451,14 @@ def _recalc_avg(platform: str):
     live_stats[platform]["avg_score"] = round(live_stats[platform]["sum_score"] / cnt, 2) if cnt else 0.0
 
 
+def _recalc_industry_avg(key: str):
+    """NEW — recompute one industry's own average intent score."""
+    st = industry_score_stats[key]
+    st["avg_score"] = round(st["sum_score"] / st["count"], 2) if st["count"] else 0.0
+
+
 def _busiest_industry() -> dict:
-    """NEW — which industry currently has the most messages."""
+    """Which industry currently has the most messages (unchanged)."""
     if not any(industry_stats.values()):
         return {"key": None, "label": None, "count": 0}
     best_key = max(industry_stats, key=lambda k: industry_stats[k])
@@ -5433,31 +5512,40 @@ async def seed_live_stats():
 
 async def seed_industry_stats():
     """
-    NEW — seed industry_stats once at startup.
+    Seed industry_stats (counts) AND industry_score_stats (own average
+    intent per industry) once at startup.
 
     Unlike live_stats (which is a pure numeric aggregation MongoDB can do
     server-side), industry classification depends on free-text content, so
     this pulls only the small set of relevant fields per doc (platform +
-    the keyword/text candidate fields) and classifies in Python. This is a
-    one-time full scan at startup — not run on a timer — after which the
-    change stream keeps industry_stats current incrementally, exactly like
-    live_stats.
+    the keyword/text candidate fields + intent_score) and classifies in
+    Python. This is a one-time full scan at startup — not run on a timer —
+    after which the change stream keeps both industry_stats and
+    industry_score_stats current incrementally, exactly like live_stats.
     """
-    projection = {"platform": 1}
+    projection = {"platform": 1, "intent_score": 1}
     for f in KEYWORD_FIELD_CANDIDATES + TEXT_FIELD_CANDIDATES:
         projection[f] = 1
 
     counts = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
+    score_totals = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
     other_breakdown.clear()
     cursor = db.signals.find({}, projection)
     async for doc in cursor:
         industry, other_source = _classify_industry_with_source(doc)
         counts[industry] = counts.get(industry, 0) + 1
+        score_totals[industry] = score_totals.get(industry, 0) + doc.get("intent_score", 0)
         if industry == OTHER_INDUSTRY_KEY:
             _record_other_breakdown(other_source)
 
     industry_stats.update(counts)
+    for key in INDUSTRY_KEYS_IN_ORDER:
+        industry_score_stats[key]["count"] = counts.get(key, 0)
+        industry_score_stats[key]["sum_score"] = score_totals.get(key, 0)
+        _recalc_industry_avg(key)
+
     log.info(f"Seeded industry stats from MongoDB | {industry_stats}")
+    log.info(f"Seeded industry average-intent stats from MongoDB | {industry_score_stats}")
 
 
 async def broadcast(payload: dict):
@@ -5501,19 +5589,24 @@ async def watch_signals():
                         live_stats[platform][_bucket(score)] += 1
                         _recalc_avg(platform)
 
-                        # NEW — classify the new signal into an industry and
-                        # bump the running tally the same way live_stats is.
+                        # Classify the new signal into an industry and bump
+                        # the running count tally the same way live_stats is.
                         industry, other_source = _classify_industry_with_source(doc)
                         industry_stats[industry] = industry_stats.get(industry, 0) + 1
                         if industry == OTHER_INDUSTRY_KEY:
                             _record_other_breakdown(other_source)
 
+                        # NEW — bump that industry's own average-intent tally.
+                        industry_score_stats[industry]["count"] += 1
+                        industry_score_stats[industry]["sum_score"] += score
+                        _recalc_industry_avg(industry)
+
                         event = {
                             "platform": platform,
                             "kind": "new_signal",
                             "score": score,
-                            "industry": industry,               # NEW
-                            "industry_label": INDUSTRY_LABELS[industry],  # NEW
+                            "industry": industry,
+                            "industry_label": INDUSTRY_LABELS[industry],
                         }
                     else:
                         # rescore changed a score after the fact — re-sum
@@ -5528,19 +5621,20 @@ async def watch_signals():
                             live_stats[platform]["medium"]    = row["medium"]
                             live_stats[platform]["low"]       = row["low"]
                             _recalc_avg(platform)
-                        # NOTE: industry is not recomputed here — a rescore
-                        # changes intent_score, not the post's text/keyword,
-                        # so the industry bucket a signal already landed in
-                        # doesn't change.
+                        # NOTE: industry (and its average-intent tally) is not
+                        # recomputed here — a rescore changes intent_score,
+                        # not the post's text/keyword, so the industry bucket
+                        # a signal already landed in doesn't change.
                         event = {"platform": platform, "kind": "rescored", "score": score}
 
                     await broadcast({
                         "type": "stats",
                         "data": live_stats,
                         "event": event,
-                        "industries": industry_stats,                 # NEW
-                        "busiest_industry": _busiest_industry(),       # NEW
-                        "other_breakdown": _top_other_breakdown(),     # NEW
+                        "industries": industry_stats,
+                        "industry_avg_intent": industry_score_stats,   # NEW
+                        "busiest_industry": _busiest_industry(),
+                        "other_breakdown": _top_other_breakdown(),
                     })
         except PyMongoError as exc:
             log.error(f"Change stream error: {exc} — reconnecting in 5s...")
@@ -5598,13 +5692,40 @@ async def queue_poll_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW — helpers for the admin-only full-message-details endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _json_safe(value):
+    """Recursively convert Mongo-flavoured values (ObjectId, datetime) into
+    plain JSON-serializable types, leaving everything else untouched."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _check_admin_password(password: str):
+    """Fails closed: if ADMIN_PASSWORD isn't set in .env, every request is
+    refused rather than silently allowed through."""
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="ADMIN_PASSWORD is not configured on the server (.env).")
+    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid admin password.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def on_startup():
     await seed_live_stats()
-    await seed_industry_stats()  # NEW
+    await seed_industry_stats()
     asyncio.create_task(watch_signals())
     asyncio.create_task(queue_poll_loop())
     log.info("FLINTEL CRM Dashboard ready — http://0.0.0.0:8100")
@@ -5628,11 +5749,14 @@ async def dashboard(request: Request):
         "mongodb_db":       MONGODB_DB,
         "min_score_medium": MIN_SCORE_MEDIUM,
         "min_score_high":   MIN_SCORE_HIGH,
-        # NEW — industry breakdown, passed through for the template to render.
+        # industry breakdown, passed through for the template to render
+        # (unchanged — same shape as before).
         "industries":       industry_stats,
         "industry_labels":  INDUSTRY_LABELS,
         "busiest_industry": _busiest_industry(),
         "other_breakdown":  _top_other_breakdown(),
+        # NEW — extra context, safe to ignore if crm.html doesn't use it yet.
+        "industry_avg_intent": industry_score_stats,
     })
 
 
@@ -5645,9 +5769,10 @@ async def ws_live(websocket: WebSocket):
         await websocket.send_json({
             "type": "stats",
             "data": live_stats,
-            "industries": industry_stats,               # NEW
-            "busiest_industry": _busiest_industry(),     # NEW
-            "other_breakdown": _top_other_breakdown(),   # NEW
+            "industries": industry_stats,
+            "industry_avg_intent": industry_score_stats,   # NEW
+            "busiest_industry": _busiest_industry(),
+            "other_breakdown": _top_other_breakdown(),
         })
         queues  = await get_queue_snapshot()
         rescore = await get_rescore_snapshot()
@@ -5680,10 +5805,9 @@ async def health():
 @app.get("/api/debug-industry-fields")
 async def debug_industry_fields():
     """
-    NEW — diagnostic endpoint. Everything is landing in "Other" almost
-    always means the KEYWORD_FIELD_CANDIDATES / TEXT_FIELD_CANDIDATES
-    field names don't actually match your `signals` schema. This endpoint
-    returns:
+    Diagnostic endpoint. Everything landing in "Other" almost always means
+    the KEYWORD_FIELD_CANDIDATES / TEXT_FIELD_CANDIDATES field names don't
+    actually match your `signals` schema. This endpoint returns:
       - every top-level field name found on a sample document
       - out of a 500-doc sample, how many docs actually have a non-empty
         value for each candidate field we're currently checking
@@ -5734,13 +5858,25 @@ async def debug_industry_fields():
 @app.get("/api/industries")
 async def api_industries():
     """
-    NEW — standalone endpoint for the industry breakdown, in case the
-    dashboard template isn't updated yet to render it. Returns per-industry
+    Standalone endpoint for the industry breakdown, in case the dashboard
+    template isn't updated yet to render it. Returns per-industry message
     counts plus which industry currently has the most messages.
+
+    NEW: each entry also now includes that industry's own average
+    intent_score (avg_intent) — a separate number from the per-platform
+    averages shown elsewhere, and separate from the plain message count.
+    This part is NOT password-protected (it's aggregate numbers only, no
+    raw message content) — see /api/admin/messages for the full-JSON,
+    password-gated version.
     """
     return {
         "industries": [
-            {"key": key, "label": INDUSTRY_LABELS[key], "count": industry_stats.get(key, 0)}
+            {
+                "key": key,
+                "label": INDUSTRY_LABELS[key],
+                "count": industry_stats.get(key, 0),
+                "avg_intent": industry_score_stats.get(key, {}).get("avg_score", 0.0),  # NEW
+            }
             for key in INDUSTRY_KEYS_IN_ORDER
         ],
         "busiest_industry": _busiest_industry(),
@@ -5749,6 +5885,72 @@ async def api_industries():
             "keyword_field_candidates": KEYWORD_FIELD_CANDIDATES,
             "text_field_candidates": TEXT_FIELD_CANDIDATES,
         },
+    }
+
+
+@app.get("/api/admin/messages")
+async def admin_messages(
+    password: str,
+    platform: str = None,
+    industry: str = None,
+    limit: int = 200,
+):
+    """
+    NEW — ADMIN-ONLY endpoint, gated behind ADMIN_PASSWORD (set in .env).
+    Meant to power a "Details" button in the dashboard: the button first
+    asks the person for the admin password, then calls this endpoint,
+    which returns full raw signal documents (not just aggregated counts)
+    as JSON — each one annotated with the industry it was classified into.
+
+    Example: every Reddit message classified as Fintech & Payments ->
+        /api/admin/messages?password=...&platform=reddit&industry=fintech_payments
+
+    Query params:
+      password  (required) — must match ADMIN_PASSWORD from .env
+      platform  (optional) — filter to one platform (reddit, twitter, ...)
+      industry  (optional) — filter to one industry key (fintech_payments,
+                              cybersecurity, ..., or "other")
+      limit     (optional, default 200, max 2000) — max messages returned
+
+    Since industry classification is computed on the fly (not stored on
+    the document), filtering by industry scans a wider window of recent
+    documents (still bounded) and classifies each one in Python until
+    `limit` matches are found or the scan window is exhausted.
+    """
+    _check_admin_password(password)
+
+    if platform and platform not in PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Unknown platform '{platform}'. Valid: {PLATFORMS}")
+    if industry and industry not in INDUSTRY_KEYS_IN_ORDER:
+        raise HTTPException(status_code=400, detail=f"Unknown industry '{industry}'. Valid: {INDUSTRY_KEYS_IN_ORDER}")
+
+    limit = max(1, min(limit, 2000))
+    scan_cap = max(limit * 25, 3000)
+
+    query = {}
+    if platform:
+        query["platform"] = platform
+
+    matched = []
+    scanned = 0
+    cursor = db.signals.find(query).sort("_id", -1).limit(scan_cap)
+    async for doc in cursor:
+        scanned += 1
+        doc_industry = classify_industry(doc)
+        if industry and doc_industry != industry:
+            continue
+        safe_doc = _json_safe(doc)
+        safe_doc["_classified_industry"] = doc_industry
+        safe_doc["_classified_industry_label"] = INDUSTRY_LABELS[doc_industry]
+        matched.append(safe_doc)
+        if len(matched) >= limit:
+            break
+
+    return {
+        "count": len(matched),
+        "scanned": scanned,
+        "filters": {"platform": platform, "industry": industry, "limit": limit},
+        "messages": matched,
     }
 
 
