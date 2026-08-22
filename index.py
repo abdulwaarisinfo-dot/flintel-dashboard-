@@ -197,7 +197,7 @@ INDUSTRIES = {
             "embedded finance", "currency exchange", "money transfer", "international payments",
             "b2b payments", "merchant account", "card processing", "checkout flow",
             "billing platform", "subscription billing", "recurring billing", "invoice payments",
-            "buy now pay later", "bnpl", "digital wallet", "e-wallet", "mobile wallet",
+            "buy now pay later", "bnpl", "digital wallet", "e-wallet", "mobile wallet", "charging too much",
             "kyc", "aml compliance", "correspondent banking", "treasury management",
             "currency conversion", "exchange rate", "money transmitter", "payfac",
             "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
@@ -599,7 +599,7 @@ INDUSTRIES = {
         "keywords": [
             
               "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
-            "crm alternative", "crm migration", "sales pipeline", "hubspot", "zoho crm",
+            "crm alternative", "crm migration", "sales pipeline", "hubspot", "zoho crm", "absolute ripoff",
             "pipedrive", "sales tool", "sales tools", "lead gen", "lead generation",
             "lead scoring", "lead management", "deal pipeline", "sales funnel",
             "outbound sales", "cold outreach", "email sequences", "sales cadence",
