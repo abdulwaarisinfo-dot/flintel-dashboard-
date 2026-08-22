@@ -206,7 +206,7 @@ INDUSTRIES = {
              "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
     "stripe banned my account", "stripe suspended my account",
     "stripe account closed", "stripe account frozen", "stripe rejected my business",
-    "stripe withheld my payout", "stripe payout delayed",
+    "stripe withheld my payout", "stripe payout delayed", "FX fees", "unexpected charges",
     "stripe high fees", "stripe hidden fees", "why is stripe so expensive",
     "stripe terrible support", "stripe chargeback problems", "money disappeared", "no tracking",
     "stripe too many chargebacks", "stripe withdrawal issues",
