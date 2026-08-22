@@ -202,7 +202,7 @@ INDUSTRIES = {
             "currency conversion", "exchange rate", "money transmitter", "payfac",
             "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
             "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup",
-            "fintech platform", "money held",
+            "fintech platform", "money held", "won't release my funds", "money hostage",
              "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
     "stripe banned my account", "stripe suspended my account",
     "stripe account closed", "stripe account frozen", "stripe rejected my business",
