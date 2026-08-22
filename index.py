@@ -691,7 +691,7 @@ INDUSTRIES = {
     "RevOps manager", "revenue operations manager", "CRM administrator",
     "Salesforce administrator", "Salesforce admin", "Salesforce developer",
     "sales enablement manager", "director of sales operations",
-    "chief revenue officer", "CRO", "sales operations analyst", "LinkedIn automation for founders" , "Creating product descriptions"
+    "chief revenue officer", "CRO", "sales operations analyst", "LinkedIn automation for founders" , "Creating product descriptions", "ai ad copy generator for shopify"
     
         ],
     },
