@@ -1081,7 +1081,7 @@ INDUSTRIES = {
         "label": "Accounting Software",
         "keywords": [
             
-             "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
+             "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero", "medication adherence tracking devices",
             "accounting", "accounting software", "accounting platform", "accounting tool",
             "accounting firm", "cpa firm", "tax software", "tax filing", "tax preparation",
             "tax compliance", "invoice", "invoicing", "invoicing software", "billing software",
