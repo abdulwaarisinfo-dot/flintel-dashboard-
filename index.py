@@ -46,6 +46,13 @@ Classification logic, per document:
      `body` — whichever field exists on the doc).
   3. If nothing matches, the signal is bucketed as "Other".
 
+  NEW — matching isn't required to be a 100% exact/substring hit anymore.
+  If nothing matches exactly, a fuzzy fallback checks whether the value
+  is at least ~70% similar (configurable via FUZZY_MATCH_THRESHOLD) to
+  one of an industry's keywords (e.g. "wise block my account" ~ "wise
+  block account") and counts it toward that industry if so. This applies
+  the same way across every industry's keyword list.
+
 This does not change the existing per-platform tally logic at all — it
 runs alongside it, using the same seed (startup aggregation replaced by
 a scan for industry purposes) and the same change-stream events.
@@ -58,6 +65,7 @@ Run:
 
 import os
 import re
+import difflib
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -134,7 +142,7 @@ INDUSTRIES = {
     "fintech_payments": {
         "label": "Fintech & Payments",
         "keywords": [
-            "cross-border", "cross border", "cross border payment", "cross-border payments",
+"cross-border", "cross border", "cross border payment", "cross-border payments",
             "payment", "payments", "payment gateway", "payment processor", "payment processing",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate",
@@ -543,7 +551,7 @@ INDUSTRIES = {
     "crm_sales": {
         "label": "CRM & Sales Tools",
         "keywords": [
-            "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
+   "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
             "crm alternative", "crm migration", "sales pipeline", "hubspot", "zoho crm",
             "pipedrive", "sales tool", "sales tools", "lead gen", "lead generation",
             "lead scoring", "lead management", "deal pipeline", "sales funnel",
@@ -698,7 +706,7 @@ INDUSTRIES = {
     "logistics": {
         "label": "Logistics",
         "keywords": [
-            "shipping", "freight", "freight forwarding", "freight broker", "ltl shipping",
+  "shipping", "freight", "freight forwarding", "freight broker", "ltl shipping",
             "ftl shipping", "carrier switch", "carrier", "carriers", "supply chain",
             "supply chain software", "supply chain disruption", "logistics", "logistics provider",
             "fulfillment", "order fulfillment", "warehouse", "warehouse management", "wms",
@@ -1024,7 +1032,7 @@ INDUSTRIES = {
     "accounting": {
         "label": "Accounting Software",
         "keywords": [
-            "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
+ "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
             "accounting", "accounting software", "accounting platform", "accounting tool",
             "accounting firm", "cpa firm", "tax software", "tax filing", "tax preparation",
             "tax compliance", "invoice", "invoicing", "invoicing software", "billing software",
@@ -1176,6 +1184,8 @@ INDUSTRIES = {
     },
     "ai_agents": {
         "label": "AI Agents",
+        "keywords": [
+                 "label": "AI Agents",
         "keywords": [
              "best ai agent for startups",
     "best ai agent for small business",
@@ -4184,7 +4194,7 @@ INDUSTRIES = {
         "label": "Community Software / Online Community Platform",
         "keywords": [
             
-                "a community software for our users for networking between members",
+                     "a community software for our users for networking between members",
     "a community platform with mobile app for my business with groups and channels",
     "a simple community platform for our SaaS customers with organized discussions",
     "looking for a branded community platform for a global community that helps build stronger member relationships",
@@ -5183,7 +5193,7 @@ INDUSTRIES = {
     "a better alternative to Slack communities for our customers that supports paid memberships",
     "best community platform for a gaming community that is more focused than Slack",
     "searching for a community platform for my audience for our SaaS customers with private spaces"
-    
+            
             ],
     },
 }
@@ -5242,6 +5252,42 @@ def _match_industry_from_string(s: str):
         score = sum(len(kw) for kw, pattern in patterns if pattern.search(s))
         if score > best_score:
             best_key, best_score = key, score
+    if best_key:
+        return best_key
+
+    # NEW — fuzzy fallback. If nothing matched exactly (word-boundary),
+    # the value may still be a close variant of a keyword — e.g. a
+    # search_keyword of "wise block my account" isn't a substring match
+    # for "wise block account", but it's clearly the same intent. Only
+    # runs when the exact pass above found nothing, so it never overrides
+    # an exact match; applies uniformly across every industry's keyword
+    # list, same as the exact pass.
+    return _fuzzy_match_industry_from_string(s)
+
+
+FUZZY_MATCH_THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "0.70"))
+
+
+def _fuzzy_match_industry_from_string(s: str):
+    """
+    NEW — fuzzy fallback used only when the exact word-boundary pass in
+    _match_industry_from_string finds no match. Compares s against every
+    keyword across every industry using difflib's SequenceMatcher ratio
+    (a 0.0–1.0 similarity score). If a keyword clears
+    FUZZY_MATCH_THRESHOLD (default 0.70, i.e. 70% similar), that industry
+    is counted as a match. Returns the industry key belonging to the
+    single highest-ratio keyword at/above the threshold, or None if
+    nothing clears it.
+    """
+    if not s:
+        return None
+    s_norm = " ".join(s.strip().lower().split())
+    best_key, best_ratio = None, 0.0
+    for key, cfg in INDUSTRIES.items():
+        for kw in cfg["keywords"]:
+            ratio = difflib.SequenceMatcher(None, s_norm, kw.lower()).ratio()
+            if ratio >= FUZZY_MATCH_THRESHOLD and ratio > best_ratio:
+                best_key, best_ratio = key, ratio
     return best_key
 
 
