@@ -1,324 +1,382 @@
 """
-FLINTEL v9.11 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
-                + BATCHED SEARCH-VOLUME PRE-SEEDING)
-                + Twitter/X Signal Scorer
-=================================================================================
-Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
-            site:reddit.com, real per-post rank -> Reddit public per-post 
-            RSS feed, smart-retry, no credentials required)
-          + Twitter/X (tweepy v2)
+FLINTEL CRM DASHBOARD — index.py
+=================================
+Real-time, READ-ONLY monitoring dashboard for the FLINTEL signal
+intelligence system. 
 
-=================================================================================
-WHAT CHANGED IN THIS BUILD (v9.11.1) — KEYWORD CACHE IS NOW THE SOLE
-SOURCE OF TRUTH FOR "DUE" / "MISSING VOLUME", INDEPENDENT OF THE PYTHON
-LIST. LOGIC 100% AS-IS OTHERWISE.
-=================================================================================
+Connects to the EXACT SAME MongoDB database + collections the background
+service (flintel.py) already writes to:
 
-  ISSUE (confirmed, not a code bug elsewhere): get_due_keywords() and
-    get_keywords_missing_volume() were filtering flintel_keywords with
-    {"keyword": {"$in": REDDIT_SEARCH_KEYWORDS}} — i.e. against whatever
-    the REDDIT_SEARCH_KEYWORDS python list happens to contain RIGHT NOW.
-    That meant: if a keyword was ever removed from (or swapped out of)
-    the python list — even though it was already stored in
-    flintel_keywords with fetched=False (never actually processed) or
-    search_volume=None (never actually seeded) — it would silently stop
-    being picked up. It wasn't deleted from Mongo, it just became
-    invisible to these two queries because it no longer matched the
-    CURRENT python list. That's the python list "forgetting" a keyword
-    that Mongo still has pending — which is backwards: flintel_keywords
-    is supposed to be the permanent, restart-safe record; the python
-    list is supposed to be nothing more than "what to make sure EXISTS
-    in that record" (via sync_keywords_to_db()'s $setOnInsert, which was
-    already correctly insert-only and untouched by this fix).
+    signals                  — every scored signal, all 5 platforms
+    flintel_pending_batch     — current in-progress batch per platform
+    flintel_queue_messages    — persisted raw-queue backlog per platform
+    flintel_rescore_messages  — manual rescore queue
 
-  FIX — get_due_keywords() and get_keywords_missing_volume() now query
-    flintel_keywords DIRECTLY, with NO "$in: REDDIT_SEARCH_KEYWORDS"
-    restriction at all:
-      - get_due_keywords()          -> find({"fetched": False})
-      - get_keywords_missing_volume() -> find({"search_volume": None})
-    So ANY keyword sitting in flintel_keywords with fetched=False (or
-    search_volume=None) is picked up and processed on the very next
-    pass — regardless of whether that keyword is still present in the
-    REDDIT_SEARCH_KEYWORDS python list at that moment. If you edit the
-    python list and remove/replace a keyword, the OLD keyword's
-    flintel_keywords document is untouched (nothing here ever deletes
-    from that collection) and it is still fetched exactly as before —
-    the python list swap does not erase or hide it. The root() status
-    endpoint's "keywords_due_now" / "keywords_missing_search_volume" /
-    "keywords_with_random_search_volume" counters were changed the same
-    way (dropped the same "$in: REDDIT_SEARCH_KEYWORDS" restriction) so
-    they stay consistent with what the loop itself will actually pick up.
+This service NEVER writes to Mongo and NEVER touches flintel.py's own
+state — it only reads. It does not poll the whole `signals` collection on
+a timer either: it opens ONE MongoDB Change Stream on `signals` at
+startup and keeps an in-memory running tally (count / high / medium / low
+/ average) per platform, updated incrementally as new documents arrive.
+That tally is pushed to every connected browser over a WebSocket the
+instant it changes — real "+1 the moment a message lands," with a single
+long-lived Mongo connection instead of repeated find()/aggregate() calls.
 
-    Everything else about the keyword-cache system is UNCHANGED:
-    sync_keywords_to_db() still only INSERTS brand-new keywords from the
-    python list via $setOnInsert (never touches/overwrites an existing
-    doc), mark_keyword_fetched() still permanently flips fetched=True
-    with no TTL/re-due date, and the "fetch a keyword exactly once,
-    ever" guarantee is untouched — this fix only removes the accidental
-    extra python-list filter sitting on top of the two read queries, it
-    does not change how/when keywords get inserted, marked fetched, or
-    seeded with volume.
+Only the small batch/queue/rescore documents (a handful of tiny docs) are
+lightly polled every 5s, since those aren't insert-only streams worth a
+change-stream subscription.
 
-=================================================================================
-CARRIED FORWARD FROM v9.11 — REDDIT FETCH SWITCHED FROM .json TO
-RSS (per-post) + RANDOM ENGAGEMENT FALLBACK, LOGIC 100% AS-IS OTHERWISE
-=================================================================================
+────────────────────────────────────────────────────────────────────────
+INDUSTRY CLASSIFICATION (everything above/below this note is otherwise
+untouched from the original script)
+────────────────────────────────────────────────────────────────────────
+Every signal is additionally bucketed into one of the industries shown
+in the client's category picker (Fintech & Payments, Cybersecurity,
+CRM & Sales Tools, Logistics, Recruitment & HR, Accounting Software,
+AI Agents, Community Software), falling back to "Other" if nothing
+matches.
 
-  ROOT CAUSE (confirmed, not a code bug): Reddit's public, anonymous
-    .json endpoint was returning 403 on EVERY attempt, on BOTH the
-    primary host (www.reddit.com) AND the old.reddit.com fallback host,
-    across every retry/backoff cycle. That pattern — 100% failure across
-    every attempt on both hosts — is the signature of Reddit blanket-
-    blocking the server's IP itself (very common for cloud/datacenter
-    IP ranges) for anonymous .json/API-shaped traffic. No amount of
-    request-shape/pacing/User-Agent tuning on that endpoint can fix an
-    IP-level block. The SERP/Google-rank discovery call
-    (search_google_for_keyword()) was NEVER affected by this — it runs
-    on a completely separate RapidAPI host and kept returning real post
-    URLs + ranks the whole time, exactly as logged.
+Classification logic, per document:
+  1. If the doc has a `search_keyword` (or `keyword` / `matched_keyword`)
+     field AND it is available (present, non-null, non-empty), that
+     value ALONE decides the industry — matched against the industry
+     keyword lists. Post text is NOT consulted in this case, even if it
+     would otherwise have matched something.
+  2. Only if that field is unavailable (missing/null/empty) does the
+     dashboard fall back to matching industry keywords against the
+     post's own text (`text` / `post_text` / `message` / `content` /
+     `body` — whichever field exists on the doc).
+  3. If nothing matches, the signal is bucketed as "Other".
 
-  CHANGE 1 — Reddit per-post fetch switched from the .json endpoint to
-    Reddit's public per-post RSS feed (same URL, `.rss` suffix instead
-    of `.json` — e.g. .../comments/<id>/<slug>.rss), fetched with the
-    exact same v9.6 smart-retry (proper User-Agent, jittered exponential
-    backoff, old.reddit.com fallback host) — nothing about the retry
-    logic changed, only the URL suffix and the response parser (RSS/Atom
-    via feedparser instead of JSON). This mirrors the RSS-based approach
-    already used for Reddit elsewhere, just applied to a single known
-    post_url (from SERP discovery) instead of a whole subreddit's
-    /new.rss feed, since the exact post is already known here.
+This does not change the existing per-platform tally logic at all — it
+runs alongside it, using the same seed (startup aggregation replaced by
+a scan for industry purposes) and the same change-stream events.
 
-  CHANGE 2 — Reddit's RSS format does NOT expose numeric upvotes or
-    comment counts (this is a genuine schema limitation of Reddit's RSS
-    feeds, not a parsing bug — those fields simply are not present in
-    the feed). Since Component 3 (Engagement Signal) of the Claude
-    scoring model needs a numeric upvotes/comments value to score
-    against, `upvotes` and `comments` are now generated as a random
-    placeholder in the REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN..MAX range
-    (default 100-3000, env-configurable) for every Reddit post fetched
-    via RSS — the exact same "random fallback" pattern already used for
-    search_volume: every single occurrence is logged with a clearly-
-    labelled "RANDOM FALLBACK" warning naming the exact values used and
-    the reason (Reddit RSS does not expose engagement counts), and the
-    item carries an `engagement_is_random` flag through to the "SAVED"
-    log line, so it is always distinguishable in the logs from a real,
-    provider-returned number — never silently indistinguishable.
+────────────────────────────────────────────────────────────────────────
+NEW — PER-INDUSTRY AVERAGE INTENT (added — everything else in this file
+is otherwise untouched)
+────────────────────────────────────────────────────────────────────────
+Alongside the existing `industry_stats` (plain message counts per
+industry, used by the public dashboard exactly as before — untouched),
+this adds a SEPARATE running tally, `industry_score_stats`, of each
+industry's own average `intent_score` (count / sum_score / avg_score).
+This is its own independent number from the per-platform averages in
+`live_stats` — the two never overwrite or feed into each other. It is
+seeded once at startup (alongside the industry count seed) and kept
+current incrementally via the same `signals` change stream, on insert
+only (a rescore changes a score but not which industry a post already
+landed in, so it does not shift which bucket the average belongs to).
 
-    Everything downstream is otherwise UNCHANGED: item schema returned
-    by fetch_reddit_post_by_url() still has the same keys (message_id,
-    platform, text, username, subreddit_or_channel, post_url, posted_at,
-    search_keyword, upvotes, comments, google_rank, search_volume) — so
-    queueing, batching, Claude scoring, and Mongo storage need zero
-    schema changes. The Google-rank SERP call and the search-volume
-    batch seeding (real value or logged random fallback) are fully
-    untouched and still run exactly as before, on their own independent
-    RapidAPI host, regardless of the Reddit post-fetch outcome.
+────────────────────────────────────────────────────────────────────────
+NEW — ADMIN-ONLY FULL MESSAGE DETAILS (added — everything else in this
+file is otherwise untouched)
+────────────────────────────────────────────────────────────────────────
+A new endpoint, GET /api/admin/messages, returns full raw signal
+documents (not just aggregated counts) as JSON, each annotated with the
+industry it was classified into. It is gated behind an ADMIN_PASSWORD
+value set in .env — every request must pass ?password=... matching that
+value, or it is rejected. This is meant to sit behind a "Details" button
+in the dashboard UI (not included in this file) that first asks for the
+admin password, then calls this endpoint to show every message behind an
+industry number, e.g. every Reddit message classified as Fintech &
+Payments.
 
-=================================================================================
-CARRIED FORWARD FROM v9.9 — SEARCH-VOLUME RANDOM-FALLBACK FIX,
-LOGIC 100% AS-IS
-=================================================================================
+Set in your .env:
+    ADMIN_PASSWORD=your-secret-password-here
 
-  ISSUE — When the search-volume ("search/mo") RapidAPI call fails or its
-    credits/quota run out, search_volume was stored as None forever
-    (until a manual retry). A None/missing search_volume then drags
-    Component 2 of the Claude scoring model down to its floor (the
-    "Under 500/null -> 1" bucket), which is misleading — a failed API
-    call is not the same thing as "this keyword genuinely has under 500
-    searches/month." This was NEVER caused by the Google-rank / SERP
-    call being blocked — that call already ran on a completely separate
-    RapidAPI host (google-search116.p.rapidapi.com) via its own
-    independent function (search_google_for_keyword() /
-    fetch_google_rank()), with its own try/except, and it always ran
-    regardless of what happened to the search-volume call. That
-    independence is UNCHANGED and reconfirmed by this build.
+────────────────────────────────────────────────────────────────────────
+NEW — KEYWORDS EMPTIED OUT
+────────────────────────────────────────────────────────────────────────
+Every industry's `keywords` list below has been intentionally emptied to
+`[]` so you can re-populate them yourself. Nothing else about the
+INDUSTRIES structure (keys, labels, ordering) has changed. Until you add
+keywords back in, every signal will fall through to "Other" (see
+classify_industry() above) — that's expected, not a bug.
 
-    FIX: whenever a search-volume call fails, returns no usable field,
-    times out, isn't configured, or errors for any reason, a random
-    placeholder value in the SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range
-    (default 300-5000, env-configurable) is generated and used in place
-    of None. Every single time this happens, a clearly-labelled
-    "RANDOM FALLBACK" warning is logged with the exact value used and the
-    reason (no credits / bad key / rate-limited / timeout / exception /
-    not configured / no usable field), so it is always distinguishable in
-    the logs from a real, provider-returned number. Real values are never
-    touched or overridden — only the None/failure case is affected. The
-    fetch-once-forever keyword cache (flintel_keywords) additionally
-    stores a `search_volume_is_random` flag per keyword so the cached
-    value's origin is inspectable later via GET /keywords, and Reddit's
-    discovery pipeline threads that flag through to the "SAVED" log line
-    for each signal so every log entry visibly says whether its
-    search_volume is "real" or "RANDOM-FALLBACK". No schema change to the
-    `signals` Mongo collection, no change to control flow, dedup, queues,
-    batching, Claude scoring, or anything else.
-=================================================================================
-
-  Everything else — the fetch-once-forever discovery cache design,
-  the per-keyword SERP call, the sequential one-keyword-fully-finishes-
-  before-the-next-starts flow, the post_url dedup, the queues, the batch
-  processor, the Claude scorer, the rescore processor, the FastAPI
-  endpoints, the "batched" (per-keyword-call) search-volume seeding loop
-  structure, the _dig_value()/_dig_list() field-extraction helpers — ALL
-  of it is kept 100% AS-IS. No schema, no logic, no flow changed anywhere
-  in this build beyond dropping the accidental python-list filter on the
-  two keyword-cache read queries (see "WHAT CHANGED IN THIS BUILD" at the
-  top). No OAuth/PRAW — that was already removed in v9.10 and stays
-  removed.
+Run:
+    pip install fastapi uvicorn "motor" python-dotenv jinja2 websockets --break-system-packages
+    python index.py
+    → http://localhost:8100
 """
 
+import os
+import re
+import hmac
 import asyncio
 import logging
-import os
-import json
-import time
-import queue
-import random
-import re
-import html
-import threading
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-import anthropic
-import httpx
-import tweepy
-import requests
-import feedparser
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
-from fastapi import FastAPI, HTTPException, Security, Depends
-from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
-from starlette.status import HTTP_403_FORBIDDEN
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.templating import Jinja2Templates
 import uvicorn
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENV / LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
+from bson import ObjectId
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import PyMongoError
 
 load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | flintel-crm | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("flintel")
+log = logging.getLogger("flintel-crm")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
+# CONFIG — same env vars as flintel.py, so this points at the SAME cluster/DB
 # ─────────────────────────────────────────────────────────────────────────────
-
-TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
-CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 
-# Optional generic label/context — used ONLY as a fallback google_rank
-# lookup for Twitter items (Twitter has no per-post SERP discovery in
-# this design, so there is no "real" per-post rank for a tweet). If left
-# empty, Twitter items simply get google_rank=None / search_volume=None.
-SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
+# NEW — admin password gate for the full-message-details endpoint. Set this
+# in your .env as ADMIN_PASSWORD=... If it's left unset, the admin endpoint
+# refuses every request (fails closed, not open).
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
-# ── RapidAPI — SOLE provider for both Google rank AND search volume.
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
-RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
-RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
+PLATFORMS = ["reddit", "twitter", "telegram", "facebook", "linkedin"]
 
-# ── RapidAPI call timeouts — configurable so a slow keyword doesn't
-# get killed early. These are LIVE endpoint calls
-# — real-time, no polling/task-based async needed.
-DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
-DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
-REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch as of v9.11
+PLATFORM_LABELS = {
+    "reddit":   "Reddit",
+    "twitter":  "Twitter / X",
+    "telegram": "Telegram",
+    "facebook": "Facebook",
+    "linkedin": "LinkedIn",
+}
 
-REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
-TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
-RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
+# Display-only — mirrors flintel.py's batch env vars so the dashboard can
+# show "3/10 items, 45s of 120s elapsed" without needing write access.
+BATCH_CONFIG = {
+    "reddit":   {"batch_size": int(os.getenv("REDDIT_BATCH_SIZE",   "10")), "timeout": int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",   "120"))},
+    "twitter":  {"batch_size": int(os.getenv("TWITTER_BATCH_SIZE",  "50")), "timeout": int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS",  "120"))},
+    "telegram": {"batch_size": int(os.getenv("TELEGRAM_BATCH_SIZE", "10")), "timeout": int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))},
+    "facebook": {"batch_size": int(os.getenv("FACEBOOK_BATCH_SIZE", "10")), "timeout": int(os.getenv("FACEBOOK_BATCH_TIMEOUT_SECONDS", "120"))},
+    "linkedin": {"batch_size": int(os.getenv("LINKEDIN_BATCH_SIZE", "10")), "timeout": int(os.getenv("LINKEDIN_BATCH_TIMEOUT_SECONDS", "1200"))},
+}
 
-REDDIT_BATCH_GAP_SECONDS      = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",      "30"))
-REDDIT_BATCH_TIMEOUT_SECONDS  = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",  "120"))
+MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
+MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
 
-TWITTER_BATCH_GAP_SECONDS     = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",     "30"))
-TWITTER_BATCH_TIMEOUT_SECONDS = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", "120"))
+# ─────────────────────────────────────────────────────────────────────────────
+# INDUSTRY CLASSIFICATION CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 
-RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
-RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
+# Which fields might hold the "this post was scraped for keyword X" value.
+# Checked in order; first one present+non-empty on the doc wins as the
+# "available" source. Override via env if your schema uses a different name.
+KEYWORD_FIELD_CANDIDATES = [
+    f.strip() for f in os.getenv(
+        "INDUSTRY_KEYWORD_FIELDS", "search_keyword,keyword,matched_keyword"
+    ).split(",") if f.strip()
+]
 
-TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
+# Which fields might hold the raw post/message text. Checked in order;
+# first one present+non-empty on the doc is used as the fallback source.
+TEXT_FIELD_CANDIDATES = [
+    f.strip() for f in os.getenv(
+        "INDUSTRY_TEXT_FIELDS", "text,post_text,message,content,body,raw_text"
+    ).split(",") if f.strip()
+]
 
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
+# NOTE: every `keywords` list below has been intentionally emptied to `[]`.
+# Re-populate them yourself — nothing else about this structure has changed.
+INDUSTRIES = {
+    "fintech_payments": {
+        "label": "Fintech & Payments",
+        "keywords": [
+            
+              "cross-border", "cross border", "cross border payment", "cross-border payments",
+            "payment", "payments", "payment gateway", "payment processor", "payment processing",
+            "payment infrastructure", "payment platform", "payment provider", "payment rails",
+            "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate",
+            "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer",
+            "iban", "swift", "stripe", "paypal", "wise transfer", "revolut", "adyen", "plaid",
+            "square payments", "venmo", "cash app", "zelle", "banking", "bank transfer",
+            "online banking", "digital bank", "neobank", "challenger bank", "open banking",
+            "embedded finance", "currency exchange", "money transfer", "international payments",
+            "b2b payments", "merchant account", "card processing", "checkout flow",
+            "billing platform", "subscription billing", "recurring billing", "invoice payments",
+            "buy now pay later", "bnpl", "digital wallet", "e-wallet", "mobile wallet",
+            "kyc", "aml compliance", "correspondent banking", "treasury management",
+            "currency conversion", "exchange rate", "money transmitter", "payfac",
+            "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
+            "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup",
+            "fintech platform",
+             "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
+    "stripe banned my account", "stripe suspended my account",
+    "stripe account closed", "stripe account frozen", "stripe rejected my business",
+    "stripe withheld my payout", "stripe payout delayed",
+    "stripe high fees", "stripe hidden fees", "why is stripe so expensive",
+    "stripe terrible support", "stripe chargeback problems",
+    "stripe too many chargebacks", "stripe withdrawal issues",
+    "stripe funds stuck", "stripe down", "stripe problems",
+    "alternative to stripe", "switching from stripe", "leaving stripe",
+    "moving off stripe", "migrating from stripe", "replacing stripe",
+    "ditching stripe", "fed up with stripe", "done with stripe",
+    "better than stripe", "cheaper than stripe", "instead of stripe",
 
-# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG ────────────────────────────────────
-# If a search-volume ("search/mo") API call fails for ANY reason — bad/
-# exhausted RapidAPI credits, rate-limit, timeout, non-JSON body, no
-# recognizable volume field, or RAPIDAPI_KEY not configured at all — we
-# no longer leave search_volume as None. Instead we generate a random
-# placeholder in this range so scoring/dashboards always have a plausible
-# number instead of being dragged to the "no data" floor. This NEVER
-# overwrites a real, provider-returned value — it only ever fills in for
-# a genuine failure/absence, and every time it fires it is logged with a
-# clearly-labelled "RANDOM FALLBACK" warning naming the exact value used
-# and the reason, so it is always distinguishable from a real value in
-# the logs. This is completely independent of, and never blocks or is
-# blocked by, the separate Google-rank/SERP RapidAPI calls.
-SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
-SEARCH_VOLUME_RANDOM_FALLBACK_MAX = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MAX", "5000"))
+    # ── OTHER PROCESSOR/PSP PAIN (generalized, not per-platform spam) ───────
+    "PayPal froze my funds", "PayPal held my funds", "PayPal banned my account",
+    "PayPal high fees", "PayPal chargeback problems", "PayPal terrible support",
+    "Square froze my funds", "Square held my funds", "Square account closed",
+    "Adyen froze my funds", "Checkout.com froze my funds",
+    "Wise froze my funds", "Wise account closed", "Revolut froze my funds",
+    "Revolut business account blocked", "Mollie froze my funds",
+    "payment processor froze my funds", "payment processor held my funds",
+    "payment processor banned my account", "payment processor rejected my business",
+    "payment processor withheld my payout", "payment processor payout delayed",
+    "payment processor high fees", "payment processor hidden fees",
+    "payment processor terrible support", "payment processor keeps failing",
+    "payment processor api keeps failing", "payment processor integration broke",
+    "payment processor no chargebacks", "payment processor too many chargebacks",
+    "payment processor won't approve my business", "payment processor limits too low",
+    "payment processor settlement delays", "payment processor evm compatible",
 
+    # ── CRYPTO PAYMENT GATEWAY: SETUP / HOW-TO ────────────────────────────────
+    "how to accept crypto payments", "how to accept bitcoin payments",
+    "how to accept USDT payments", "how to accept USDC payments",
+    "how to accept stablecoin payments", "how to accept ethereum payments",
+    "how to accept solana payments", "how to accept web3 payments",
+    "how to accept crypto for my SaaS", "how to accept crypto for my store",
+    "how to accept crypto for my ecommerce store", "how to accept crypto on my site",
+    "how to accept crypto at checkout", "best way to accept crypto payments",
+    "start accepting crypto payments", "add crypto payments to my site",
+    "integrate crypto payments", "implement crypto payments",
+    "enable crypto payments", "set up crypto payments",
+    "accept crypto payments for SaaS", "accept crypto payments for ecommerce",
 
-def _random_search_volume_fallback() -> int:
-    """Generates one random placeholder search_volume in the configured
-    range. Pulled into its own tiny helper purely so every call site uses
-    the exact same range/behavior."""
-    return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
+    # ── CRYPTO GATEWAY: RECOMMENDATION / COMPARISON ──────────────────────────
+    "looking for crypto payment gateway", "looking for crypto payment processor",
+    "looking for crypto payments provider", "recommend a crypto payment gateway",
+    "anyone using a crypto payment gateway", "what's the best crypto payment gateway",
+    "best crypto payment gateway for SaaS", "crypto payment gateway comparison",
+    "crypto payment gateway low fees", "crypto payment gateway no chargebacks",
+    "crypto payment gateway non-custodial", "crypto payment gateway self-hosted",
+    "crypto payment gateway no kyc", "crypto payment gateway instant settlement",
+    "crypto payment gateway multi-chain", "crypto payment gateway evm compatible",
+    "crypto payment gateway developer friendly", "crypto payment gateway with api",
+    "crypto payment gateway no rolling reserve", "crypto payment gateway fast payouts",
+    "crypto payment gateway global", "which crypto payment gateway is best",
+    "experience with crypto payment gateway", "thoughts on crypto payment gateway",
+    "who offers a crypto payment gateway",
 
+    # ── SPECIFIC CRYPTO PROCESSOR COMPLAINTS ─────────────────────────────────
+    "bitpay froze my funds", "bitpay banned my account", "bitpay high fees",
+    "bitpay problems", "bitpay support terrible", "alternative to bitpay",
+    "coinbase commerce froze my funds", "coinbase commerce down",
+    "coinbase commerce banned my account", "coinbase commerce high fees",
+    "alternative to coinbase commerce",
+    "nowpayments froze my funds", "nowpayments problems", "nowpayments high fees",
+    "moonpay froze my funds", "moonpay banned my account", "moonpay problems",
+    "transak froze my funds", "transak problems", "transak high fees",
+    "ramp froze my funds", "ramp problems", "ramp banned my account",
+    "banxa froze my funds", "banxa problems",
+    "triple-a froze my funds", "triple-a problems",
+    "bvnk froze my funds", "bvnk problems",
+    "0xprocessing froze my funds", "0xprocessing problems",
+    "opennode froze my funds", "opennode problems",
+    "btcpay server froze my funds", "btcpay server problems",
+    "cryptomus froze my funds", "cryptomus problems",
+    "plisio froze my funds", "plisio problems",
+    "coingate froze my funds", "coingate problems",
+    "coinpayments froze my funds", "coinpayments problems",
+    "utrust froze my funds", "utrust problems",
+    "circle froze my funds", "circle problems",
+    "paxos froze my funds", "paxos problems",
+    "fireblocks froze my funds",
+    "wyre froze my funds", "wyre shut down",
+    "sardine froze my funds",
+    "alchemy pay froze my funds",
 
-# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG ────────────
-# Reddit's public RSS feed (used as of v9.11 for the per-post fetch — see
-# module docstring) does NOT expose numeric upvote or comment counts —
-# this is a genuine schema limitation of the RSS format itself, not a
-# parsing bug. Since Component 3 (Engagement Signal) of the Claude
-# scoring model needs a numeric value to score against, every Reddit
-# post fetched via RSS gets a random placeholder upvotes/comments value
-# in this range instead of None/0, using the exact same "random
-# fallback, always logged, never silently indistinguishable from a real
-# value" pattern already used for search_volume above.
-REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN", "100"))
-REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX", "3000"))
+    # ── HIGH RISK / RESTRICTED INDUSTRY MERCHANT ACCOUNTS ────────────────────
+    "high risk merchant account", "need a high risk merchant account",
+    "looking for a high risk merchant account", "high risk merchant account rejected",
+    "high risk merchant account declined", "high risk payment processor",
+    "high risk crypto processor", "offshore merchant account",
+    "offshore crypto processor", "forex payment processor",
+    "gambling payment processor", "igaming payment processor",
+    "casino crypto payments", "adult payment processor",
+    "cbd payment processor", "nutra payment processor",
+    "crypto processor for high risk business", "merchant account for crypto business",
+    "payment processor for restricted industries",
 
+    # ── STABLECOIN / SPECIFIC ASSET RAILS ─────────────────────────────────────
+    "USDT payment gateway", "USDC payment gateway", "stablecoin payment gateway",
+    "accept USDT payments for business", "accept USDC payments for business",
+    "onchain payments for business", "crypto on-ramp for business",
+    "crypto off-ramp for business", "fiat on-ramp integration",
+    "crypto acquiring solution", "crypto checkout solution",
+    "crypto invoicing tool", "crypto billing platform",
+    "agent payments for AI", "AI agent payments infrastructure",
+    "programmatic crypto payments", "machine-to-machine crypto payments",
 
-def _random_engagement_fallback() -> int:
-    """Generates one random placeholder upvotes/comments value in the
-    configured range. Separate helper (own range) from the search-volume
-    one above, even though the pattern is identical, so the two ranges
-    can be tuned independently."""
-    return random.randint(REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN, REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX)
+    # ── COMPLIANCE / KYC / KYB PAIN ────────────────────────────────────────────
+    "KYB rejected", "KYB verification failed", "KYC rejected crypto",
+    "AML compliance crypto payments", "compliance issue crypto payments",
+    "regulatory issue accepting crypto", "licensing requirements crypto payments",
+    "MSB license crypto payments", "crypto payment compliance nightmare",
 
+    # ── BUSINESS CONTEXT ────────────────────────────────────────────────────────
+    "SaaS founder payment processing", "ecommerce store payment processing",
+    "marketplace payment infrastructure", "startup needs payment processor",
+    "cross-border payments crypto", "international payments crypto business",
+    "web3 startup payments", "DAO payment infrastructure",
+    "on-chain business payments", "crypto native business payments",
 
-# ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
-# Keywords now live DIRECTLY in this Python list — no .env / os.getenv
-# involved. To add a new keyword, just add a new string to this list and
-# restart (or, if hot-reload is set up, it gets picked up on the next
-# sync pass). Everything downstream is unchanged:
-#   - sync_keywords_to_db() inserts any keyword NOT already in
-#     flintel_keywords with fetched=False, search_volume=None.
-#   - get_keywords_missing_volume() + seed_search_volume_batch() fill in
-#     search_volume for any keyword that doesn't have one yet, IN BATCHES
-#     of up to 500 keywords per DataForSEO request (never one-by-one).
-#     As of v9.11.1 this looks at ALL of flintel_keywords, not just
-#     whatever happens to still be in this python list right now — see
-#     the "WHAT CHANGED IN THIS BUILD" note at the top of this file.
-#   - get_due_keywords() picks up only fetched=False keywords — same
-#     v9.11.1 change: looks at ALL of flintel_keywords, not just this
-#     python list.
-#   - mark_keyword_fetched() flips a keyword to fetched=True PERMANENTLY
-#     right after it finishes processing — it will never be re-fetched.
-REDDIT_SEARCH_KEYWORDS = [
-    "Wise blocked my account",
+    # ── URGENCY / SWITCHING SIGNALS ──────────────────────────────────────────
+    "need a new payment processor urgently", "payment processor shut down my business",
+    "processor terminated my account", "need a backup payment processor",
+    "diversifying payment processors", "risk of losing payment processor",
+    "worried about getting cut off by stripe", "worried about account termination",
+    
+        "deal at risk", "relationship at risk",
+    "can't wait any longer", "running out of time", "no more time",
+
+    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
+    "just signed a supplier", "signed a new supplier", "found a supplier",
+    "new supplier in", "signed a contract with", "new contract with",
+    "starting to import", "starting an import", "starting to export",
+    "starting an export", "launching in", "expanding to",
+    "entering the market", "new market", "setting up payments",
+    "need to set up payments", "need to transfer money",
+    "will need to send", "will need to transfer", "going to need",
+    "starting a business", "new business", "import business",
+    "export business", "trading company", "sourcing products from",
+    "sourcing goods from", "buying products from", "buying goods from",
+    "manufacturing in", "producing in",
+
+    # ── TREASURY & FX ────────────────────────────────────────────────────────
+    "treasury management", "cash management", "liquidity management",
+    "FX management", "FX exposure", "FX risk", "FX hedging",
+    "currency hedging", "currency risk", "currency exposure",
+    "FX solution", "FX platform", "FX tool",
+    "treasury solution", "treasury platform", "cash flow management",
+    "multi currency", "multi-currency", "multicurrency",
+    "currency account", "foreign currency account",
+    "international banking", "international bank account",
+    "global banking", "global bank account", "correspondent banking",
+    "banking relationship", "banking partner",
+    "payment infrastructure", "payment rails", "payment solution",
+    "payment platform", "payment provider", "payment partner",
+    "fintech payment", "embedded payment", "embedded finance",
+    "cross border banking", "international banking solution",
+    "FX banking", "FX banking relationship", "FX liquidity",
+    "cash pooling", "cash concentration",
+    "intercompany payment", "intercompany transfer",
+
+    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
+    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
+    "FX trader", "treasury director", "head of treasury", "VP treasury",
+    "international payments manager", "global payments manager",
+    "cross border payments", "payments operations manager",
+    "payments specialist", "treasury specialist", "FX specialist",
+    "international finance manager", "global finance manager",
+    "head of payments", "director of payments", "VP payments",
+    "chief financial officer", "head of finance", "finance director",
+    "controller international", "global controller",
+
+        "Wise blocked my account",
     "bank blocked my transfer",
     "Wise Business restricted",
     "Payoneer account blocked",
@@ -339,7 +397,7 @@ REDDIT_SEARCH_KEYWORDS = [
     "no dedicated finance person", "growing business need better accounting",
     "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
     "virtual CFO", "fractional CFO", "need a fractional CFO",
-    "part time bookkeeper", "part time accountant",
+    "part time bookkeeper", "part time accountant", "CFO"
 
       "urgently need a bookkeeper", "need books cleaned up ASAP",
     "tax deadline approaching", "need this done before tax season",
@@ -372,2511 +430,5531 @@ REDDIT_SEARCH_KEYWORDS = [
     "overseas wire transfer", "overseas transfer", "global payment",
     "global transfer", "b2b payment", "b2b transfer",
     "business to business payment",
-]
+            
+            ],
+    },
+    "cybersecurity": {
+        "label": "Cybersecurity",
+        "keywords": [
+            
+             "breach", "data breach", "security breach", "cyberattack", "cyber attack",
+            "hacked", "hacking", "vulnerability", "vulnerable", "malware", "ransomware",
+            "ransomware attack", "phishing", "phishing attack", "firewall", "pentest",
+            "penetration test", "penetration testing", "soc2", "soc 2", "soc analyst",
+            "compliance audit", "security audit", "security compliance", "data leak",
+            "leaked credentials", "credential stuffing", "zero-day", "zero day",
+            "endpoint security", "endpoint detection", "edr", "xdr", "siem",
+            "incident response", "threat intel", "threat intelligence", "intrusion detection",
+            "ids", "ips", "waf", "web application firewall", "vpn", "mfa",
+            "two factor authentication", "2fa", "encryption", "ddos", "denial of service",
+            "patch management", "vulnerability scan", "vulnerability management",
+            "red team", "blue team", "iso 27001", "gdpr compliance", "hipaa compliance",
+            "pci dss", "cyber insurance", "security vendor", "cloud security",
+            "network security", "zero trust", "identity access management", "iam",
+            "privileged access", "security operations center", "malware analysis",
+            "supply chain attack", "insider threat", "cybersecurity", "infosec",
+            
+             # ── INCIDENT / BREACH SIGNALS ────────────────────────────────────────────
+    "we got hacked", "we got breached", "company got hacked",
+    "company got breached", "data breach", "we had a breach",
+    "security breach", "breach happened", "just got ransomwared",
+    "ransomware attack", "ransomware hit us", "hit by ransomware",
+    "encrypted our files", "files got encrypted", "systems encrypted",
+    "locked out of our systems", "locked out of our servers",
+    "attacker got in", "attackers got in", "unauthorized access",
+    "someone accessed our", "someone breached our", "network compromised",
+    "systems compromised", "account compromised", "accounts compromised",
+    "email compromised", "credentials leaked", "credentials stolen",
+    "password leaked", "passwords leaked", "data leaked", "data exposed",
+    "customer data exposed", "customer data leaked", "PII exposed",
+    "PII leaked", "source code leaked", "database leaked",
+    "database exposed", "exfiltrated data", "data exfiltration",
+    "phishing attack", "phishing email", "spear phishing",
+    "business email compromise", "BEC attack", "CEO fraud",
+    "invoice fraud", "wire fraud attack", "supply chain attack",
+    "zero day exploit", "zero-day exploit", "actively exploited",
+    "malware infection", "infected with malware", "trojan detected",
+    "backdoor found", "backdoor discovered", "rootkit found",
+    "DDoS attack", "under DDoS", "site went down attack",
+    "insider threat", "insider attack", "third party breach",
+    "vendor breach", "supplier breach", "MSP breach",
 
-# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
-# A keyword is fetched from DataForSEO exactly ONE time, ever. Once marked
-# fetched=True, it is PERMANENTLY skipped — no 12h/24h/whatever re-fetch,
-# no TTL expiry, nothing. This guarantees Claude/signals data is never
-# disturbed by the same keyword being re-searched and re-processed later.
-# The ONLY way a keyword gets processed again is if it is removed from
-# flintel_keywords manually (or the collection is reset).
-#
-# KEYWORD_CHECK_INTERVAL_SECONDS -> how often the loop wakes up to ask
-#                        "are there any NEW (never-fetched) keywords, or
-#                        any keyword still missing a search_volume?"
-#                        This is a cheap DB query, NOT a DataForSEO call
-#                        by itself — the (batched) DataForSEO call only
-#                        fires when there is actually something missing.
-#
-# v9.11.1: "due" and "missing volume" are now determined PURELY from
-# flintel_keywords itself (fetched=False / search_volume=None on the
-# stored document) — NOT from whether the keyword still happens to be
-# present in the REDDIT_SEARCH_KEYWORDS python list above. The python
-# list's only job is to tell sync_keywords_to_db() which brand-new
-# keywords to INSERT (insert-only, via $setOnInsert — never overwrites
-# an existing doc). Editing/replacing entries in the python list later
-# does not remove, hide, or "forget" any keyword already sitting in
-# flintel_keywords — a keyword that's still fetched=False there keeps
-# getting picked up and processed regardless of the current python list
-# contents, and a keyword still missing search_volume there keeps
-# getting seeded regardless of the current python list contents too.
-KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
+    # ── INCIDENT RESPONSE URGENCY ────────────────────────────────────────────
+    "need incident response", "need an IR firm", "need a forensics team",
+    "who do I call after a breach", "who to call after hack",
+    "emergency incident response", "24/7 incident response",
+    "need help now hacked", "actively being attacked",
+    "attack in progress", "attacker still in our network",
+    "containment help", "need containment", "need remediation",
+    "recovering from ransomware", "ransomware recovery",
+    "should we pay the ransom", "pay the ransom or not",
+    "ransom demand", "ransom note", "threat actor demanding",
+    "need to notify customers breach", "breach notification requirements",
+    "legally required to disclose breach", "disclose the breach",
 
-SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
-SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
-SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
+    # ── TOOLING / PLATFORM FRUSTRATION ───────────────────────────────────────
+    "our SIEM missed it", "SIEM didn't catch it", "SIEM false positives",
+    "too many false positives", "alert fatigue", "drowning in alerts",
+    "no visibility into our network", "no visibility into endpoints",
+    "can't see what's happening on our network",
+    "our EDR didn't catch it", "EDR missed", "antivirus didn't catch it",
+    "firewall got bypassed", "firewall wasn't enough",
+    "our current tool isn't working", "outgrown our current tool",
+    "outgrown our security stack", "current vendor isn't cutting it",
+    "switching security vendors", "replacing our SIEM",
+    "replacing our EDR", "need a new MDR", "need a new SOC",
+    "understaffed security team", "no security team",
+    "one person security team", "no dedicated security staff",
+    "can't afford a full SOC", "need outsourced SOC",
+    "need a virtual CISO", "need a fractional CISO", "need vCISO",
 
-# ── SEARCH-VOLUME BATCH SEEDING CONFIG ──────────────────────────────────────
-# search_volume/live bills PER REQUEST, not per keyword, and accepts up to
-# 1000 keywords in a single call. We use 500 as a safe default chunk size.
-SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "12"))
+    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
+    "security tools too expensive", "cybersecurity budget too small",
+    "can't justify the cost", "pricing is outrageous",
+    "licensing costs killing us", "per-endpoint pricing too high",
+    "hidden costs security vendor", "surprise renewal fees",
+    "renewal price increase", "price hike renewal",
+    "cheaper alternative to CrowdStrike", "cheaper alternative to SentinelOne",
+    "cheaper EDR", "cheaper SIEM", "cheaper MDR",
+    "affordable cybersecurity for small business",
+    "budget-friendly security tools", "best value security platform",
 
-# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, can differ ──
-TWITTER_SEARCH_KEYWORDS = [
-    kw.strip() for kw in os.getenv(
-        "TWITTER_SEARCH_KEYWORDS",
-        "Wise blocked,bank blocked my transfer,Payoneer blocked,"
-        "cross border payment,CRM is a nightmare,recommend a CRM,"
-        "we got hacked,ransomware attack,need incident response,"
-        "Salesforce alternative,switching from HubSpot"
-    ).split(",") if kw.strip()
-]
+    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
+    "CrowdStrike outage", "CrowdStrike issue", "CrowdStrike problem",
+    "CrowdStrike blocked", "CrowdStrike alternative",
+    "SentinelOne problem", "SentinelOne issue", "SentinelOne alternative",
+    "switching from CrowdStrike", "switching from SentinelOne",
+    "leaving Microsoft Defender", "Defender missed", "Defender didn't catch",
+    "Palo Alto issue", "Palo Alto problem", "Fortinet vulnerability",
+    "Fortinet issue", "Fortinet exploit", "Cisco vulnerability",
+    "Cisco exploit", "Sophos problem", "Sophos issue",
+    "Trend Micro problem", "McAfee problem", "Norton problem",
+    "Rapid7 issue", "Qualys issue", "Tenable issue", "Splunk too expensive",
+    "Splunk alternative", "Datadog security alternative",
+    "leaving our MSSP", "switching MSSPs", "MSSP isn't responsive",
+    "our MSP dropped the ball", "MSP missed the breach",
+    "alternative to Norton", "alternative to McAfee",
+    "alternative to Splunk", "alternative to Rapid7",
+    "better than CrowdStrike", "better than SentinelOne",
 
-# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, unchanged ──────────────
-# Governs the retry/backoff/User-Agent behaviour of fetch_reddit_post_by_url()
-# — used for the per-post RSS fetch as of v9.11 (public, credential-free,
-# no OAuth/PRAW). Does NOT change what data is extracted or where it
-# goes — only how reliably we get a 200 instead of a 403 from Reddit's
-# public per-post RSS feed (.rss).
-REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
-REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
-REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
-REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
-# Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
-REDDIT_USER_AGENT = os.getenv(
-    "REDDIT_USER_AGENT",
-    "python:flintel-signal-bot:v9.11 (by /u/flintel_signals)",
-)
+    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
+    "recommend a SIEM", "recommend an EDR", "recommend an MDR",
+    "recommend a firewall", "recommend a security vendor",
+    "recommend a pentest firm", "recommend a security consultant",
+    "anyone used", "has anyone used", "does anyone recommend",
+    "what EDR do you use", "what SIEM do you use",
+    "which security tool is best", "best EDR for small business",
+    "best SIEM for startups", "best MDR provider",
+    "best pentest company", "looking for a security vendor",
+    "looking for a pentest firm", "looking for an MSSP",
+    "need a security assessment", "need a vulnerability assessment",
+    "need a penetration test", "need a pen test", "need a red team",
+    "who should we hire for security", "who do you use for security",
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API KEY AUTH (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── COMPLIANCE PAIN ───────────────────────────────────────────────────────
+    "SOC 2 audit failed", "failed SOC 2", "SOC 2 readiness",
+    "need SOC 2 compliance", "preparing for SOC 2",
+    "ISO 27001 certification", "need ISO 27001", "ISO 27001 audit",
+    "PCI DSS compliance", "failed PCI audit", "PCI compliance issue",
+    "HIPAA violation", "HIPAA compliance issue", "HIPAA audit",
+    "GDPR fine", "GDPR violation", "GDPR compliance issue",
+    "CMMC compliance", "CMMC certification", "NIST compliance",
+    "NIST framework", "failed audit", "audit findings",
+    "compliance deadline", "compliance gap", "compliance nightmare",
+    "regulators are asking", "auditor flagged", "auditors flagged",
 
-API_KEY = os.getenv("API_KEY", "")
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query  = APIKeyQuery(name="api_key",    auto_error=False)
+    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
+    "urgently need", "critical vulnerability", "emergency patch",
+    "patch immediately", "exploit in the wild", "actively exploited",
+    "ASAP security", "need help immediately", "time sensitive breach",
+    "board is asking questions", "customers are asking questions",
+    "losing customers over breach", "losing the contract over security",
+    "insurance requires", "cyber insurance requirement",
+    "cyber insurance denied claim", "can't get cyber insurance",
+    "insurance premium went up after breach",
+
+    # ── BUSINESS EXPANSION / GROWTH ──────────────────────────────────────────
+    "building our security program", "starting a security program",
+    "hiring our first security hire", "hiring a CISO",
+    "scaling our security team", "growing security team",
+    "new compliance requirement", "new client requires SOC 2",
+    "client requiring security review", "vendor security questionnaire",
+    "security questionnaire from client", "need to pass security review",
+
+    # ── JOB SIGNALS ───────────────────────────────────────────────────────────
+    "CISO", "chief information security officer", "security engineer",
+    "security analyst", "SOC analyst", "SOC manager",
+    "head of security", "director of security", "VP security",
+    "security operations manager", "threat intel analyst",
+    "incident response manager", "GRC manager", "GRC analyst",
+    "penetration tester", "red team lead", "blue team lead",
+    "application security engineer", "cloud security engineer",
+    "detection engineer", "security architect",
+            
+            ],
+    },
+    "crm_sales": {
+        "label": "CRM & Sales Tools",
+        "keywords": [
+            
+              "salesforce", "salesforce alternative", "crm", "crm software", "crm platform",
+            "crm alternative", "crm migration", "sales pipeline", "hubspot", "zoho crm",
+            "pipedrive", "sales tool", "sales tools", "lead gen", "lead generation",
+            "lead scoring", "lead management", "deal pipeline", "sales funnel",
+            "outbound sales", "cold outreach", "email sequences", "sales cadence",
+            "account based marketing", "abm", "sales enablement", "sales analytics",
+            "sales forecasting", "contact management", "customer database", "sales dialer",
+            "sales automation", "sales engagement", "gong", "outreach.io", "apollo.io",
+            "close crm", "monday sales crm", "copper crm", "nutshell crm", "insightly",
+            "sugarcrm", "microsoft dynamics", "sales navigator", "prospecting tool",
+            "pipeline management", "sales stack", "customer relationship management",
+            "our CRM is a mess", "CRM is too complicated", "CRM too complex",
+    "CRM is clunky", "clunky CRM", "outdated CRM", "CRM feels outdated",
+    "hate our CRM", "CRM is a nightmare", "CRM nightmare",
+    "CRM isn't working for us", "CRM not working for our team",
+    "outgrown our CRM", "outgrown our current CRM",
+    "CRM doesn't scale", "CRM can't handle our volume",
+    "CRM is too slow", "CRM keeps crashing", "CRM keeps freezing",
+    "CRM data is a mess", "messy CRM data", "duplicate contacts CRM",
+    "duplicate leads CRM", "CRM data quality issues",
+    "no one updates the CRM", "reps don't update the CRM",
+    "sales team hates the CRM", "sales team won't use the CRM",
+    "low CRM adoption", "poor CRM adoption", "CRM adoption problem",
+    "manual data entry CRM", "too much manual data entry",
+    "spreadsheets instead of CRM", "still using spreadsheets for sales",
+    "tracking leads in spreadsheets", "tracking deals in spreadsheets",
+    "no visibility into pipeline", "no pipeline visibility",
+    "can't see our pipeline", "pipeline is a black box",
+    "forecasting is a guess", "sales forecasting is inaccurate",
+    "inaccurate sales forecast", "forecast doesn't match reality",
+    "reports take forever", "building reports manually",
+    "CRM reporting is limited", "CRM reporting is weak",
+
+    # ── SETUP / IMPLEMENTATION FRUSTRATION ───────────────────────────────────
+    "CRM implementation nightmare", "CRM implementation failed",
+    "CRM setup took months", "CRM migration nightmare",
+    "migrating off our CRM", "migrating from our CRM",
+    "CRM onboarding took forever", "took too long to set up CRM",
+    "CRM customization is hard", "hard to customize our CRM",
+    "need a developer to change anything", "too technical for our team",
+    "CRM requires an admin", "need a dedicated CRM admin",
+    "consultants to set up CRM", "paying consultants for CRM",
+
+    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
+    "CRM is too expensive", "CRM pricing too high",
+    "CRM cost too much", "per seat pricing CRM", "per user pricing CRM",
+    "CRM licensing costs", "CRM renewal price increase",
+    "CRM price hike", "surprise CRM fees", "hidden fees CRM",
+    "add-ons cost extra CRM", "everything is an add-on",
+    "paying for features we don't use", "paying for unused seats",
+    "cheaper alternative to Salesforce", "cheaper than Salesforce",
+    "cheaper CRM", "affordable CRM for small business",
+    "budget-friendly CRM", "CRM on a budget", "best value CRM",
+    "CRM ROI", "not seeing ROI from our CRM",
+
+    # ── COMPETITOR / SALESFORCE MENTIONS ─────────────────────────────────────
+    "Salesforce is too complex", "Salesforce too complicated",
+    "Salesforce is overkill", "Salesforce overkill for small business",
+    "Salesforce too expensive", "Salesforce pricing",
+    "Salesforce alternative", "alternative to Salesforce",
+    "leaving Salesforce", "switching from Salesforce",
+    "migrating from Salesforce", "migrating off Salesforce",
+    "moving away from Salesforce", "Salesforce is a pain",
+    "Salesforce admin nightmare", "need a Salesforce admin",
+    "HubSpot alternative", "alternative to HubSpot",
+    "switching from HubSpot", "leaving HubSpot", "HubSpot too expensive",
+    "HubSpot pricing", "HubSpot limitations",
+    "Zoho CRM problem", "Zoho CRM issue", "switching from Zoho",
+    "Pipedrive limitations", "Pipedrive alternative", "switching from Pipedrive",
+    "Monday CRM problem", "Monday sales CRM issue",
+    "Copper CRM problem", "Close CRM alternative",
+    "Freshsales problem", "Freshsales alternative",
+    "Insightly problem", "Insightly alternative",
+    "Nimble CRM problem", "SugarCRM problem",
+    "Microsoft Dynamics alternative", "Dynamics 365 too complex",
+    "alternative to HubSpot", "alternative to Pipedrive",
+    "alternative to Zoho", "alternative to Monday CRM",
+    "better than Salesforce", "better than HubSpot",
+    "better than Pipedrive", "competitors to Salesforce",
+    "Salesforce competitors", "HubSpot competitors",
+
+    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
+    "recommend a CRM", "recommend a sales tool", "recommend a pipeline tool",
+    "recommend a sales platform", "anyone recommend a CRM",
+    "can anyone recommend a CRM", "does anyone recommend a CRM",
+    "what CRM do you use", "what CRM should I use",
+    "which CRM is best", "which CRM should we use",
+    "best CRM for small business", "best CRM for startups",
+    "best CRM for sales teams", "best CRM for agencies",
+    "best CRM for real estate", "best CRM for solo founders",
+    "best sales pipeline tool", "best pipeline management tool",
+    "best sales tracking tool", "best lead tracking tool",
+    "looking for a CRM", "looking for a sales tool",
+    "looking for a pipeline tool", "searching for a CRM",
+    "need a CRM", "need a sales tool", "need a pipeline tool",
+    "need a better CRM", "need a simple CRM", "need an easy CRM",
+    "anyone using a CRM", "does anyone use", "has anyone used",
+    "who uses", "what do you use for sales", "what are you using for CRM",
+    "tried several CRMs", "tried multiple CRMs", "tried everything CRM",
+    "still looking for a CRM", "still haven't found a CRM",
+
+    # ── SALES TOOLS / PIPELINE ────────────────────────────────────────────────
+    "sales pipeline management", "pipeline management tool",
+    "sales pipeline tracking", "deal tracking tool",
+    "lead tracking software", "lead management tool",
+    "lead scoring tool", "sales automation tool",
+    "sales engagement platform", "sales enablement tool",
+    "outbound sales tool", "cold outreach tool", "cold email tool",
+    "sales prospecting tool", "prospecting software",
+    "sales sequence tool", "email sequencing tool",
+    "sales dialer", "auto dialer sales", "call tracking sales",
+    "quote to cash", "proposal software sales", "contract management sales",
+    "sales forecasting tool", "revenue operations tool",
+    "RevOps tool", "sales analytics tool", "sales dashboard tool",
+    "deal desk tool", "sales stack", "sales tech stack",
+    "building our sales stack", "sales tools we use",
+
+    # ── BUSINESS CONTEXT ──────────────────────────────────────────────────────
+    "my sales team", "our sales team", "small sales team",
+    "growing sales team", "scaling our sales team", "sales reps need",
+    "sales manager needs", "head of sales needs",
+    "startup sales process", "our sales process", "no sales process",
+    "informal sales process", "need a sales process",
+    "founder-led sales", "solo founder sales", "one-person sales team",
+    "agency CRM needs", "real estate CRM needs",
+    "B2B sales pipeline", "B2B sales tool", "B2B sales software",
+    "SaaS sales tool", "SaaS CRM", "startup CRM",
+
+    # ── COMPLIANCE / DATA ─────────────────────────────────────────────────────
+    "CRM data security", "CRM GDPR compliance", "CRM data privacy",
+    "CRM permissions issue", "CRM access control",
+    "data silos sales marketing", "sales and marketing not aligned",
+    "CRM integration issue", "CRM doesn't integrate with",
+    "CRM integration with email", "CRM integration with marketing",
+    "CRM API limitations", "CRM lacks integrations",
+
+    # ── URGENCY / EXPANSION SIGNALS ───────────────────────────────────────────
+    "urgently need a CRM", "need a CRM ASAP", "need this set up quickly", "Copy.ai",
+    "launching soon need CRM", "onboarding new sales hires",
+    "just hired our first salesperson", "scaling our sales operations",
+    "new sales hire needs a CRM", "board wants better reporting",
+    "investors asking about pipeline", "need better reporting for investors",
+
+    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
+    "VP of sales", "head of sales", "sales operations manager",
+    "RevOps manager", "revenue operations manager", "CRM administrator",
+    "Salesforce administrator", "Salesforce admin", "Salesforce developer",
+    "sales enablement manager", "director of sales operations",
+    "chief revenue officer", "CRO", "sales operations analyst", "LinkedIn automation for founders" , "Creating product descriptions", "ai ad copy generator for shopify"
+            
+            ],
+    },
+    "logistics": {
+        "label": "Logistics",
+        "keywords": [
+            
+             "shipping", "freight", "freight forwarding", "freight broker", "ltl shipping",
+            "ftl shipping", "carrier switch", "carrier", "carriers", "supply chain",
+            "supply chain software", "supply chain disruption", "logistics", "logistics provider",
+            "fulfillment", "order fulfillment", "warehouse", "warehouse management", "wms",
+            "inventory management", "fleet", "fleet management", "last mile", "last-mile",
+            "last mile delivery", "3pl", "third party logistics", "trucking", "trucking company",
+            "dispatch", "cargo shipping", "container shipping", "customs clearance",
+            "import export", "port congestion", "delivery tracking", "shipment tracking",
+            "carrier rates", "shipping rates", "parcel shipping", "courier service",
+            "cold chain logistics", "drop shipping", "dropshipping", "route optimization",
+            "distribution center", "freight rates", "freight quote",
+            # ── SHIPPING / DELIVERY PROBLEMS ──────────────────────────────────────────
+    "shipment delayed", "shipment stuck", "shipment lost",
+    "package delayed", "package stuck", "package lost",
+    "order delayed", "order stuck in transit", "stuck in customs",
+    "held at customs", "customs delay", "customs clearance issue",
+    "customs holding my shipment", "customs rejected my shipment",
+    "freight delayed", "freight stuck", "container delayed",
+    "container stuck", "container held", "cargo delayed", "cargo stuck",
+    "shipment damaged", "damaged in transit", "damaged freight",
+    "damaged goods arrived", "arrived damaged", "goods lost in transit",
+    "missing shipment", "missing package", "missing inventory",
+    "tracking not updating", "no tracking updates",
+    "can't track my shipment", "no visibility into shipment",
+    "no visibility into freight", "no supply chain visibility",
+    "shipment taking forever", "delivery taking forever",
+    "late delivery", "missed delivery window", "missed delivery deadline",
+    "delivery delayed again", "delayed again", "shipment delayed again",
+
+    # ── CARRIER PROBLEMS / SWAPS ─────────────────────────────────────────────
+    "carrier dropped my shipment", "carrier cancelled", "carrier failed",
+    "carrier issue", "carrier problem", "carrier keeps delaying",
+    "carrier unreliable", "unreliable carrier", "bad carrier experience",
+    "switching carriers", "switched carriers", "need a new carrier",
+    "looking for a new carrier", "carrier alternative",
+    "alternative carrier", "carrier keeps raising rates",
+    "carrier rate increase", "carrier surcharge", "unexpected surcharge",
+    "fuel surcharge too high", "accessorial fees", "hidden carrier fees",
+    "carrier capacity issues", "no capacity available",
+    "can't get capacity", "capacity crunch", "space unavailable",
+    "booking rejected carrier", "carrier booking cancelled",
+    "carrier overbooked", "rolled shipment", "shipment rolled",
+    "carrier keeps rolling my cargo", "blank sailing",
+    "vessel delayed", "vessel skipped port", "port congestion",
+    "port delays", "port backlog", "warehouse delays",
+    "3PL problem", "3PL issue", "3PL dropped the ball",
+    "switching 3PL", "leaving our 3PL", "need a new 3PL",
+    "freight forwarder problem", "freight forwarder issue",
+    "switching freight forwarders", "need a new freight forwarder",
+    "trucking company problem", "trucking company unreliable",
+    "LTL carrier issue", "FTL carrier issue", "drayage delay",
+    "drayage problem", "last mile delivery problem",
+    "last mile delivery issues", "final mile delivery problem",
+
+    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
+    "shipping costs too high", "freight costs too high",
+    "shipping rates increased", "freight rates increased",
+    "shipping fees killing margins", "freight fees eating margins",
+    "logistics costs too high", "cheaper shipping option",
+    "cheaper freight option", "cheaper carrier", "cheaper 3PL",
+    "affordable freight forwarding", "reduce shipping costs",
+    "lower our freight costs", "cut shipping costs",
+    "shipping cost comparison", "compare freight rates",
+    "best freight rates", "best shipping rates",
+
+    # ── COMPETITOR / PLATFORM MENTIONS ───────────────────────────────────────
+    "FedEx delayed", "FedEx lost my package", "FedEx problem",
+    "FedEx issue", "UPS delayed", "UPS lost my package", "UPS problem",
+    "USPS lost my package", "USPS delayed", "USPS problem",
+    "DHL delayed", "DHL lost my package", "DHL problem",
+    "Maersk delayed", "Maersk booking issue", "MSC delayed",
+    "MSC booking issue", "CMA CGM delayed", "COSCO delayed",
+    "Flexport problem", "Flexport issue", "Flexport alternative",
+    "leaving Flexport", "switching from Flexport",
+    "project44 alternative", "FourKites alternative",
+    "ShipBob problem", "ShipBob issue", "ShipBob alternative",
+    "leaving ShipBob", "ShipStation problem", "ShipStation alternative",
+    "Shippo problem", "Shippo alternative", "EasyPost alternative",
+    "Freightos alternative", "uShip problem", "Convoy shut down",
+    "alternative to FedEx", "alternative to UPS", "alternative to DHL",
+    "alternative to Flexport", "alternative to ShipBob",
+    "better than Flexport", "better than ShipBob",
+    "competitors to Flexport", "Flexport competitors",
+
+    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
+    "recommend a freight forwarder", "recommend a carrier",
+    "recommend a 3PL", "recommend a logistics provider",
+    "recommend a shipping company", "recommend a fulfillment company",
+    "anyone recommend a carrier", "can anyone recommend a 3PL",
+    "does anyone recommend a freight forwarder",
+    "what carrier do you use", "what 3PL do you use",
+    "which carrier is best", "which 3PL is best",
+    "best freight forwarder for", "best 3PL for small business",
+    "best fulfillment company", "best shipping carrier for ecommerce",
+    "looking for a freight forwarder", "looking for a 3PL",
+    "looking for a carrier", "looking for a fulfillment partner",
+    "need a logistics partner", "need a shipping partner",
+    "need a new supplier for shipping", "anyone using",
+    "has anyone used", "who do you use for shipping",
+    "what are you using for fulfillment", "tried several carriers",
+    "tried multiple 3PLs", "still looking for a carrier",
+
+    # ── SUPPLY CHAIN / SOURCING ───────────────────────────────────────────────
+    "supply chain disruption", "supply chain issue", "supply chain problem",
+    "supply chain delay", "supply chain risk", "supply chain visibility",
+    "diversifying our supply chain", "diversify suppliers",
+    "reduce supply chain risk", "supply chain resilience",
+    "reshoring manufacturing", "nearshoring supply chain",
+    "friend-shoring", "supplier diversification",
+    "single source supplier risk", "backup supplier needed",
+    "need a backup supplier", "supplier reliability issues",
+    "supplier missed deadline", "supplier delay", "manufacturer delay",
+    "factory delay", "production delay", "inventory shortage",
+    "stock shortage", "out of stock supplier issue",
+    "inventory management problem", "warehouse management issue",
+    "demand planning problem", "forecasting supply chain",
+    "procurement issue", "procurement delay", "sourcing new supplier",
+    "sourcing new manufacturer", "vetting new supplier",
+    "supplier audit", "supplier quality issue", "quality control issue factory",
+
+    # ── BUSINESS CONTEXT ──────────────────────────────────────────────────────
+    "our warehouse", "our fulfillment center", "our distribution center",
+    "ecommerce fulfillment", "ecommerce shipping", "dropshipping supplier",
+    "dropshipping issue", "import/export logistics", "cross-border shipping",
+    "international shipping problem", "international freight",
+    "B2B shipping", "wholesale shipping", "bulk shipping",
+    "small business shipping", "startup logistics", "scaling logistics",
+    "growing ecommerce brand shipping", "DTC brand fulfillment",
+    "manufacturing overseas", "shipping from China", "shipping from Asia",
+    "container shipping from China", "freight from China",
+
+    # ── COMPLIANCE / DOCUMENTATION ────────────────────────────────────────────
+    "bill of lading issue", "customs documentation error",
+    "incoterms confusion", "wrong incoterms", "tariff increase",
+    "tariff impact supply chain", "duties and tariffs issue",
+    "import duties too high", "export documentation problem",
+    "compliance issue shipping", "trade compliance", "HS code error",
+    "denied party screening", "customs broker issue",
+    "customs broker problem", "need a customs broker",
+
+    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
+    "urgently need shipping", "need this shipped ASAP",
+    "customer waiting on shipment", "customers are angry about shipping",
+    "losing customers over shipping delays", "losing the contract shipping",
+    "peak season shipping", "holiday shipping delays",
+    "need a solution before peak season", "running out of inventory",
+    "can't fulfill orders", "backordered", "backlog of orders",
+
+    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
+    "supply chain manager", "logistics manager", "logistics coordinator",
+    "procurement manager", "sourcing manager", "fulfillment manager",
+    "warehouse manager", "operations manager logistics",
+    "VP supply chain", "head of logistics", "head of supply chain",
+    "director of logistics", "director of supply chain",
+    "chief supply chain officer", "freight broker", "logistics analyst",
+            
+            ],
+    },
+    "recruitment_hr": {
+        "label": "Recruitment & HR",
+        "keywords": [
+            
+              "recruiter", "recruiters", "recruitment", "recruiting", "recruiting software",
+            "recruiting tool", "ats", "applicant tracking system", "applicant tracking",
+            "hiring", "hiring manager", "hiring pipeline", "hr software", "hr platform",
+            "hr tool", "hris", "workforce management", "workforce planning", "onboarding",
+            "employee onboarding", "payroll", "payroll software", "payroll provider",
+            "talent acquisition", "talent management", "candidate sourcing",
+            "candidate experience", "job board", "job posting", "employer branding",
+            "performance management", "performance review", "employee engagement",
+            "benefits administration", "compensation management", "staffing agency",
+            "interview scheduling", "background check", "career site", "linkedin recruiter",
+            "indeed job", "ziprecruiter", "bamboohr", "gusto payroll", "rippling",
+            "ashby ats", "smartrecruiters", "greenhouse", "lever ats", "workday hr",
+            
+            # ── HIRING / RECRUITING PAIN POINTS ──────────────────────────────────────
+    "hiring is a nightmare", "recruiting is a nightmare",
+    "can't find good candidates", "can't find qualified candidates",
+    "struggling to hire", "struggling to find talent",
+    "talent shortage", "hard to find good talent",
+    "too many unqualified applicants", "flooded with applications",
+    "drowning in resumes", "too many resumes to screen",
+    "resume screening taking forever", "screening candidates manually",
+    "no time to screen candidates", "hiring process too slow",
+    "recruiting process too slow", "hiring taking too long",
+    "time to hire too long", "losing candidates to slow process",
+    "losing candidates to other offers", "candidate ghosted us",
+    "candidates ghosting", "no shows for interviews",
+    "interview no shows", "offer rejected", "candidate declined offer",
+    "high candidate drop off", "candidates dropping out of process",
+    "bad candidate experience", "poor candidate experience",
+    "our hiring process is broken", "broken hiring process",
+    "no structured interview process", "inconsistent interview process",
+    "hiring manager not responsive", "hiring managers slow to respond",
+    "interview feedback delayed", "no feedback loop hiring",
+
+    # ── ATS / TOOLING FRUSTRATION ─────────────────────────────────────────────
+    "our ATS is a mess", "ATS is clunky", "clunky ATS",
+    "outdated ATS", "ATS feels outdated", "hate our ATS",
+    "ATS is too complicated", "ATS too complex", "ATS doesn't work for us",
+    "outgrown our ATS", "outgrown our applicant tracking system",
+    "ATS doesn't scale", "ATS can't handle our volume",
+    "ATS is too slow", "ATS keeps crashing", "ATS keeps glitching",
+    "ATS data is a mess", "duplicate candidates ATS",
+    "no one updates the ATS", "recruiters don't use the ATS",
+    "low ATS adoption", "manual tracking candidates",
+    "tracking candidates in spreadsheets", "still using spreadsheets to hire",
+    "no visibility into hiring pipeline", "can't see our hiring pipeline",
+    "hiring pipeline is a black box", "reporting on hiring is hard",
+    "ATS reporting is limited", "ATS doesn't integrate with",
+    "ATS lacks integrations", "ATS integration issue",
+
+    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
+    "recruiting costs too high", "cost per hire too high",
+    "ATS pricing too high", "HR software too expensive",
+    "per seat pricing ATS", "per employee pricing HR software",
+    "recruiter agency fees too high", "staffing agency fees too high",
+    "hidden fees ATS", "surprise renewal fees HR software",
+    "HR software renewal price increase", "job board costs too high",
+    "job posting fees too expensive", "cheaper alternative to Greenhouse",
+    "cheaper alternative to Workday", "cheaper ATS",
+    "affordable HR software for small business", "budget-friendly ATS",
+    "best value ATS", "not seeing ROI from our ATS",
+
+    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
+    "Greenhouse too complex", "Greenhouse too expensive",
+    "Greenhouse alternative", "alternative to Greenhouse",
+    "switching from Greenhouse", "leaving Greenhouse",
+    "Workday is a nightmare", "Workday too complicated",
+    "Workday alternative", "alternative to Workday",
+    "switching from Workday", "leaving Workday",
+    "Lever alternative", "switching from Lever", "leaving Lever",
+    "BambooHR problem", "BambooHR alternative", "switching from BambooHR",
+    "ADP problem", "ADP alternative", "switching from ADP",
+    "Gusto problem", "Gusto alternative", "switching from Gusto",
+    "Rippling problem", "Rippling alternative",
+    "iCIMS problem", "iCIMS alternative", "switching from iCIMS",
+    "JazzHR alternative", "Breezy HR alternative", "Recruitee alternative",
+    "SmartRecruiters alternative", "Workable alternative",
+    "Zoho Recruit alternative", "Indeed hiring platform problem",
+    "LinkedIn Recruiter too expensive", "LinkedIn Recruiter alternative",
+    "ZipRecruiter problem", "ZipRecruiter alternative",
+    "alternative to Greenhouse", "alternative to Lever",
+    "alternative to BambooHR", "alternative to Workable",
+    "better than Greenhouse", "better than Workday",
+    "competitors to Greenhouse", "Greenhouse competitors",
+    "Workday competitors",
+
+    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
+    "recommend an ATS", "recommend a hiring tool", "recommend an HR platform",
+    "recommend a recruiting tool", "recommend a payroll provider",
+    "anyone recommend an ATS", "can anyone recommend a hiring tool",
+    "does anyone recommend an HR platform", "what ATS do you use",
+    "what HR software do you use", "which ATS is best",
+    "which HR platform is best", "best ATS for small business",
+    "best ATS for startups", "best HR software for small teams",
+    "best recruiting software", "best payroll software",
+    "best workforce management tool", "looking for an ATS",
+    "looking for an HR platform", "looking for a recruiting tool",
+    "looking for a payroll provider", "need an ATS",
+    "need an HR platform", "need a recruiting tool",
+    "need a simple ATS", "need an easy HR system",
+    "anyone using an ATS", "does anyone use", "has anyone used",
+    "who uses", "what are you using for hiring",
+    "tried several ATS platforms", "tried multiple HR tools",
+    "still looking for an ATS", "still haven't found the right HR software",
+
+    # ── RECRUITING / HR TOOLS & CATEGORIES ────────────────────────────────────
+    "applicant tracking system", "candidate relationship management",
+    "recruiting CRM", "talent acquisition software",
+    "employer branding tool", "job posting software",
+    "interview scheduling tool", "automated interview scheduling",
+    "background check software", "reference checking tool",
+    "onboarding software", "employee onboarding tool",
+    "payroll software", "benefits administration software",
+    "performance management software", "employee engagement tool",
+    "workforce management software", "HRIS platform",
+    "time tracking software HR", "PTO tracking tool",
+    "compensation management tool", "org chart software",
+    "employee scheduling software", "shift scheduling tool",
+    "recruitment marketing tool", "candidate sourcing tool",
+    "sourcing candidates tool", "resume parsing tool",
+    "skills assessment tool", "pre-employment testing",
+    "video interview platform", "async video interview tool",
+
+    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
+    "my HR team", "our HR team", "small HR team", "one person HR team",
+    "no dedicated HR person", "wearing the HR hat", "founder doing HR",
+    "growing our team", "scaling our hiring", "scaling headcount",
+    "hiring our first employee", "hiring first HR hire",
+    "startup hiring process", "no formal hiring process",
+    "need a hiring process", "remote hiring challenges",
+    "hiring remote employees", "distributed team hiring",
+    "hiring across multiple countries", "international hiring",
+    "hiring contractors vs employees", "EOR provider", "employer of record",
+    "PEO provider", "professional employer organization",
+
+    # ── COMPLIANCE / HR RISK ───────────────────────────────────────────────────
+    "compliance issue HR", "employment law compliance",
+    "wrongful termination risk", "HR compliance nightmare",
+    "I-9 compliance", "E-Verify issue", "labor law compliance",
+    "wage and hour compliance", "overtime compliance issue",
+    "worker classification issue", "1099 vs W2 issue",
+    "background check compliance", "EEOC complaint", "HR audit",
+    "failed HR audit", "employee handbook outdated",
+
+    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
+    "urgently need to hire", "need to hire ASAP", "critical role open",
+    "position open for months", "role has been open too long",
+    "losing revenue because understaffed", "understaffed team",
+    "burning out the team hiring slow", "board wants headcount plan",
+    "investors asking about headcount", "need to scale hiring fast",
+
+    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
+    "head of talent", "head of HR", "head of people",
+    "VP of people", "VP of talent", "chief people officer",
+    "talent acquisition manager", "recruiting manager",
+    "HR manager", "HR business partner", "people operations manager",
+    "HRIS manager", "compensation and benefits manager",
+    "director of talent acquisition", "director of people operations",
+    "technical recruiter", "corporate recruiter", "recruiting coordinator",
+            
+            ],
+    },
+    "accounting": {
+        "label": "Accounting Software",
+        "keywords": [
+            
+             "bookkeeping", "bookkeeper", "bookkeeping service", "quickbooks", "xero",
+            "accounting", "accounting software", "accounting platform", "accounting tool",
+            "accounting firm", "cpa firm", "tax software", "tax filing", "tax preparation",
+            "tax compliance", "invoice", "invoicing", "invoicing software", "billing software",
+            "ledger", "general ledger", "accounts payable", "accounts receivable",
+            "financial management", "financial software", "financial reporting",
+            "financial statements", "cash flow management", "expense management",
+            "expense tracking", "expense report", "budgeting software", "audit software",
+            "erp accounting", "netsuite", "sage accounting", "zoho books", "wave accounting",
+            "wave app", "bill.com", "expensify", "receipt scanning", "reconciliation software",
+            "cfo tools", "payroll accounting", "freshbooks",
+            # job-title / role signals — someone hiring for or working as one of these is
+            # an accounting-software-relevant signal even without the software name itself
+            "accountant", "staff accountant", "senior accountant", "junior accountant",
+            "finance manager", "finance director", "controller role", "financial controller",
+            "accounting clerk", "ap clerk", "ar clerk", "payroll clerk", "tax accountant",
+            # Sage products/brand — bare "sage" catches "alternative to Sage", "leaving Sage",
+            # etc. where the phrase doesn't literally say "sage accounting"
+            "sage", "sage intacct", "sage 50", "sage business cloud", "sage one",
+             # ── ACCOUNTING / BOOKKEEPING PAIN POINTS ──────────────────────────────────
+    "our books are a mess", "bookkeeping is a mess", "behind on bookkeeping",
+    "months behind on bookkeeping", "need to catch up on books",
+    "accounting is a nightmare", "accounting software is a nightmare",
+    "hate our accounting software", "accounting software too complicated",
+    "accounting software too complex", "outdated accounting software",
+    "accounting software feels outdated", "outgrown our accounting software",
+    "accounting software doesn't scale", "accounting software is too slow",
+    "accounting software keeps crashing", "accounting software keeps glitching",
+    "reconciliation is a nightmare", "bank reconciliation taking forever",
+    "reconciling accounts manually", "manual data entry accounting",
+    "too much manual data entry bookkeeping", "still using spreadsheets for accounting",
+    "tracking expenses in spreadsheets", "invoicing manually",
+    "sending invoices manually", "chasing invoices", "chasing late payments",
+    "chasing unpaid invoices", "clients not paying invoices",
+    "cash flow visibility problem", "no visibility into cash flow",
+    "can't see our cash flow", "cash flow is a black box",
+    "financial reporting takes forever", "building reports manually finance",
+    "accounting reporting is limited", "accounting reporting is weak",
+    "closing the books takes forever", "month end close takes too long",
+    "month end close nightmare", "year end accounting nightmare",
+    "tax season nightmare", "not ready for tax season",
+    "no idea what we owe in taxes", "surprised by tax bill",
+    "underestimated taxes owed", "quarterly taxes nightmare",
+
+    # ── SETUP / MIGRATION FRUSTRATION ────────────────────────────────────────
+    "accounting software migration nightmare", "migrating off our accounting software",
+    "migrating from QuickBooks", "switching accounting software",
+    "accounting software setup took months", "accounting software onboarding nightmare",
+    "hard to customize our accounting software", "need an accountant to set this up",
+    "need a bookkeeper to fix this", "paying a bookkeeper to clean up our books",
+    "cleanup project bookkeeping", "books need a cleanup",
+
+    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
+    "accounting software too expensive", "accounting software pricing too high",
+    "bookkeeping fees too high", "accountant fees too high",
+    "per user pricing accounting software", "accounting software renewal price increase",
+    "accounting software price hike", "hidden fees accounting software",
+    "add-ons cost extra accounting software", "paying for features we don't use accounting",
+    "cheaper alternative to QuickBooks", "cheaper than QuickBooks",
+    "cheaper accounting software", "affordable accounting software for small business",
+    "budget-friendly accounting software", "best value accounting software",
+    "not seeing ROI from accounting software",
+
+    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
+    "QuickBooks is a nightmare", "QuickBooks too complicated",
+    "QuickBooks too expensive", "QuickBooks pricing increase",
+    "QuickBooks alternative", "alternative to QuickBooks",
+    "leaving QuickBooks", "switching from QuickBooks",
+    "migrating from QuickBooks", "QuickBooks customer support terrible",
+    "Xero alternative", "alternative to Xero", "switching from Xero",
+    "leaving Xero", "Xero problem", "Xero issue",
+    "FreshBooks alternative", "switching from FreshBooks",
+    "Wave accounting problem", "Wave accounting alternative",
+    "Sage alternative", "Sage accounting problem", "switching from Sage",
+    "NetSuite too complex", "NetSuite too expensive", "NetSuite alternative",
+    "Zoho Books alternative", "switching from Zoho Books",
+    "Bill.com problem", "Bill.com alternative",
+    "Gusto payroll problem", "Gusto accounting integration issue",
+    "Expensify problem", "Expensify alternative",
+    "alternative to Xero", "alternative to FreshBooks",
+    "alternative to NetSuite", "alternative to Sage",
+    "better than QuickBooks", "better than Xero",
+    "competitors to QuickBooks", "QuickBooks competitors",
+    "Xero competitors",
+
+    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
+    "recommend an accounting software", "recommend a bookkeeping tool",
+    "recommend an accountant", "recommend a bookkeeper",
+    "anyone recommend an accounting software", "can anyone recommend a bookkeeper",
+    "does anyone recommend an accountant", "what accounting software do you use",
+    "which accounting software is best", "best accounting software for small business",
+    "best accounting software for startups", "best accounting software for freelancers",
+    "best invoicing software", "best expense tracking software",
+    "best bookkeeping software", "best payroll and accounting software",
+    "looking for an accounting software", "looking for a bookkeeper",
+    "looking for an accountant", "need an accounting software",
+    "need a bookkeeper", "need an accountant", "need a simple accounting tool",
+    "anyone using", "does anyone use", "has anyone used",
+    "who uses", "what are you using for accounting",
+    "tried several accounting tools", "still looking for accounting software",
+    "still haven't found the right accounting software",
+
+    # ── ACCOUNTING TOOLS & CATEGORIES ────────────────────────────────────────
+    "invoicing software", "expense tracking software", "expense management tool",
+    "receipt scanning app", "mileage tracking app", "payroll software",
+    "tax filing software", "tax preparation software", "sales tax software",
+    "sales tax compliance tool", "1099 filing software", "W2 filing software",
+    "accounts payable software", "accounts receivable software",
+    "AP automation", "AR automation", "cash flow forecasting tool",
+    "financial planning software", "FP&A tool", "budgeting software business",
+    "multi-entity accounting software", "multi-currency accounting software",
+    "inventory accounting software", "job costing software",
+    "project accounting software", "nonprofit accounting software",
+    "e-commerce accounting software", "Shopify accounting integration",
+    "Amazon seller accounting software",
+
+    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
+    "my bookkeeper", "our bookkeeper", "my accountant", "our accountant",
+    "small business accounting", "startup accounting", "solo founder accounting",
+    "freelancer accounting", "self employed accounting", "DIY bookkeeping",
+    "doing my own books", "founder doing the books", "wearing the finance hat",
+    "no dedicated finance person", "growing business need better accounting",
+    "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
+    "virtual CFO", "fractional CFO", "need a fractional CFO",
+    "part time bookkeeper", "part time accountant",
+
+    # ── COMPLIANCE / TAX RISK ─────────────────────────────────────────────────
+    "IRS audit", "audit risk small business", "tax compliance issue",
+    "missed tax deadline", "late filing penalty", "sales tax nexus issue",
+    "multi-state tax compliance", "1099 compliance issue",
+    "payroll tax compliance", "bookkeeping compliance issue",
+    "financial statements for investors", "need clean books for investors",
+    "due diligence financials", "GAAP compliance issue",
+
+    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
+    "urgently need a bookkeeper", "need books cleaned up ASAP",
+    "tax deadline approaching", "need this done before tax season",
+    "investors asking for financials", "due diligence deadline",
+    "board wants updated financials", "need financials for loan application",
+    "need financials for a loan", "applying for a business loan financials",
+
+    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
+    "controller", "VP of finance", "head of finance", "director of finance",
+    "chief financial officer", "CFO", "finance manager", "accounting manager",
+    "bookkeeper", "staff accountant", "senior accountant",
+    "accounts payable manager", "accounts receivable manager",
+    "financial analyst", "FP&A manager", "RPM software integration device API",
+    "LinkedIn post generator" , "free store health check audit", "Philips Remote Patient Monitoring"
+
+            
+            ],
+    },
+    "ai_agents": {
+        "label": "AI Agents",
+    
+        "keywords": [
+    "best ai agent for startups",
+    "best ai agent for small business",
+    "best ai agent for saas",
+    "best ai agent for agencies",
+    "best ai agent for ecommerce",
+    "best ai agent for sales teams",
+    "best ai agent for b2b",
+    "best ai agent for enterprises",
+    "best ai agent for customer support",
+    "best ai agent for marketing teams",
+    "best ai agent for real estate",
+    "best ai agent for recruiters",
+    "best ai agent for hr teams",
+    "best ai agent for healthcare",
+    "best ai agent for finance teams",
+    "best ai agent for travel companies",
+    "best ai agent for developers",
+    "best ai agent for local businesses",
+    "best ai agent for startups 2026",
+    "best ai agent in 2026",
+    "best ai agent for remote teams",
+    "top ai agent for startups",
+    "top ai agent for small business",
+    "top ai agent for saas",
+    "top ai agent for agencies",
+    "top ai agent for ecommerce",
+    "top ai agent for sales teams",
+    "top ai agent for b2b",
+    "top ai agent for enterprises",
+    "top ai agent for customer support",
+    "top ai agent for marketing teams",
+    "top ai agent for real estate",
+    "top ai agent for recruiters",
+    "top ai agent for hr teams",
+    "top ai agent for healthcare",
+    "top ai agent for finance teams",
+    "top ai agent for travel companies",
+    "top ai agent for developers",
+    "top ai agent for local businesses",
+    "top ai agent for startups 2026",
+    "top ai agent in 2026",
+    "top ai agent for remote teams",
+    "recommended ai agent for startups",
+    "recommended ai agent for small business",
+    "recommended ai agent for saas",
+    "recommended ai agent for agencies",
+    "recommended ai agent for ecommerce",
+    "recommended ai agent for sales teams",
+    "recommended ai agent for b2b",
+    "recommended ai agent for enterprises",
+    "recommended ai agent for customer support",
+    "recommended ai agent for marketing teams",
+    "recommended ai agent for real estate",
+    "recommended ai agent for recruiters",
+    "recommended ai agent for hr teams",
+    "recommended ai agent for healthcare",
+    "recommended ai agent for finance teams",
+    "recommended ai agent for travel companies",
+    "recommended ai agent for developers",
+    "recommended ai agent for local businesses",
+    "recommended ai agent for startups 2026",
+    "recommended ai agent in 2026",
+    "recommended ai agent for remote teams",
+    "affordable ai agent for startups",
+    "affordable ai agent for small business",
+    "affordable ai agent for saas",
+    "affordable ai agent for agencies",
+    "affordable ai agent for ecommerce",
+    "affordable ai agent for sales teams",
+    "affordable ai agent for b2b",
+    "affordable ai agent for enterprises",
+    "affordable ai agent for customer support",
+    "affordable ai agent for marketing teams",
+    "affordable ai agent for real estate",
+    "affordable ai agent for recruiters",
+    "affordable ai agent for hr teams",
+    "affordable ai agent for healthcare",
+    "affordable ai agent for finance teams",
+    "affordable ai agent for travel companies",
+    "affordable ai agent for developers",
+    "affordable ai agent for local businesses",
+    "affordable ai agent for startups 2026",
+    "affordable ai agent in 2026",
+    "affordable ai agent for remote teams",
+    "enterprise ai agent for startups",
+    "enterprise ai agent for small business",
+    "enterprise ai agent for saas",
+    "enterprise ai agent for agencies",
+    "enterprise ai agent for ecommerce",
+    "enterprise ai agent for sales teams",
+    "enterprise ai agent for b2b",
+    "enterprise ai agent for enterprises",
+    "enterprise ai agent for customer support",
+    "enterprise ai agent for marketing teams",
+    "enterprise ai agent for real estate",
+    "enterprise ai agent for recruiters",
+    "enterprise ai agent for hr teams",
+    "enterprise ai agent for healthcare",
+    "enterprise ai agent for finance teams",
+    "enterprise ai agent for travel companies",
+    "enterprise ai agent for developers",
+    "enterprise ai agent for local businesses",
+    "enterprise ai agent for startups 2026",
+    "enterprise ai agent in 2026",
+    "enterprise ai agent for remote teams",
+    "small business ai agent for startups",
+    "small business ai agent for small business",
+    "small business ai agent for saas",
+    "small business ai agent for agencies",
+    "small business ai agent for ecommerce",
+    "small business ai agent for sales teams",
+    "small business ai agent for b2b",
+    "small business ai agent for enterprises",
+    "small business ai agent for customer support",
+    "small business ai agent for marketing teams",
+    "small business ai agent for real estate",
+    "small business ai agent for recruiters",
+    "small business ai agent for hr teams",
+    "small business ai agent for healthcare",
+    "small business ai agent for finance teams",
+    "small business ai agent for travel companies",
+    "small business ai agent for developers",
+    "small business ai agent for local businesses",
+    "small business ai agent for startups 2026",
+    "small business ai agent in 2026",
+    "small business ai agent for remote teams",
+    "startup ai agent for startups",
+    "startup ai agent for small business",
+    "startup ai agent for saas",
+    "startup ai agent for agencies",
+    "startup ai agent for ecommerce",
+    "startup ai agent for sales teams",
+    "startup ai agent for b2b",
+    "startup ai agent for enterprises",
+    "startup ai agent for customer support",
+    "startup ai agent for marketing teams",
+    "startup ai agent for real estate",
+    "startup ai agent for recruiters",
+    "startup ai agent for hr teams",
+    "startup ai agent for healthcare",
+    "startup ai agent for finance teams",
+    "startup ai agent for travel companies",
+    "startup ai agent for developers",
+    "startup ai agent for local businesses",
+    "startup ai agent for startups 2026",
+    "startup ai agent in 2026",
+    "startup ai agent for remote teams",
+    "alternative ai agent for startups",
+    "alternative ai agent for small business",
+    "alternative ai agent for saas",
+    "alternative ai agent for agencies",
+    "alternative ai agent for ecommerce",
+    "alternative ai agent for sales teams",
+    "alternative ai agent for b2b",
+    "alternative ai agent for enterprises",
+    "alternative ai agent for customer support",
+    "alternative ai agent for marketing teams",
+    "alternative ai agent for real estate",
+    "alternative ai agent for recruiters",
+    "alternative ai agent for hr teams",
+    "alternative ai agent for healthcare",
+    "alternative ai agent for finance teams",
+    "alternative ai agent for travel companies",
+    "alternative ai agent for developers",
+    "alternative ai agent for local businesses",
+    "alternative ai agent for startups 2026",
+    "alternative ai agent in 2026",
+    "alternative ai agent for remote teams",
+    "alternatives ai agent for startups",
+    "alternatives ai agent for small business",
+    "alternatives ai agent for saas",
+    "alternatives ai agent for agencies",
+    "alternatives ai agent for ecommerce",
+    "alternatives ai agent for sales teams",
+    "alternatives ai agent for b2b",
+    "alternatives ai agent for enterprises",
+    "alternatives ai agent for customer support",
+    "alternatives ai agent for marketing teams",
+    "alternatives ai agent for real estate",
+    "alternatives ai agent for recruiters",
+    "alternatives ai agent for hr teams",
+    "alternatives ai agent for healthcare",
+    "alternatives ai agent for finance teams",
+    "alternatives ai agent for travel companies",
+    "alternatives ai agent for developers",
+    "alternatives ai agent for local businesses",
+    "alternatives ai agent for startups 2026",
+    "alternatives ai agent in 2026",
+    "alternatives ai agent for remote teams",
+    "comparison ai agent for startups",
+    "comparison ai agent for small business",
+    "comparison ai agent for saas",
+    "comparison ai agent for agencies",
+    "comparison ai agent for ecommerce",
+    "comparison ai agent for sales teams",
+    "comparison ai agent for b2b",
+    "comparison ai agent for enterprises",
+    "comparison ai agent for customer support",
+    "comparison ai agent for marketing teams",
+    "comparison ai agent for real estate",
+    "comparison ai agent for recruiters",
+    "comparison ai agent for hr teams",
+    "comparison ai agent for healthcare",
+    "comparison ai agent for finance teams",
+    "comparison ai agent for travel companies",
+    "comparison ai agent for developers",
+    "comparison ai agent for local businesses",
+    "comparison ai agent for startups 2026",
+    "comparison ai agent in 2026",
+    "comparison ai agent for remote teams",
+    "vs ai agent for startups",
+    "vs ai agent for small business",
+    "vs ai agent for saas",
+    "vs ai agent for agencies",
+    "vs ai agent for ecommerce",
+    "vs ai agent for sales teams",
+    "vs ai agent for b2b",
+    "vs ai agent for enterprises",
+    "vs ai agent for customer support",
+    "vs ai agent for marketing teams",
+    "vs ai agent for real estate",
+    "vs ai agent for recruiters",
+    "vs ai agent for hr teams",
+    "vs ai agent for healthcare",
+    "vs ai agent for finance teams",
+    "vs ai agent for travel companies",
+    "vs ai agent for developers",
+    "vs ai agent for local businesses",
+    "vs ai agent for startups 2026",
+    "vs ai agent in 2026",
+    "vs ai agent for remote teams",
+    "pricing ai agent for startups",
+    "pricing ai agent for small business",
+    "pricing ai agent for saas",
+    "pricing ai agent for agencies",
+    "pricing ai agent for ecommerce",
+    "pricing ai agent for sales teams",
+    "pricing ai agent for b2b",
+    "pricing ai agent for enterprises",
+    "pricing ai agent for customer support",
+    "pricing ai agent for marketing teams",
+    "pricing ai agent for real estate",
+    "pricing ai agent for recruiters",
+    "pricing ai agent for hr teams",
+    "pricing ai agent for healthcare",
+    "pricing ai agent for finance teams",
+    "pricing ai agent for travel companies",
+    "pricing ai agent for developers",
+    "pricing ai agent for local businesses",
+    "pricing ai agent for startups 2026",
+    "pricing ai agent in 2026",
+    "pricing ai agent for remote teams",
+    "review ai agent for startups",
+    "review ai agent for small business",
+    "review ai agent for saas",
+    "review ai agent for agencies",
+    "review ai agent for ecommerce",
+    "review ai agent for sales teams",
+    "review ai agent for b2b",
+    "review ai agent for enterprises",
+    "review ai agent for customer support",
+    "review ai agent for marketing teams",
+    "review ai agent for real estate",
+    "review ai agent for recruiters",
+    "review ai agent for hr teams",
+    "review ai agent for healthcare",
+    "review ai agent for finance teams",
+    "review ai agent for travel companies",
+    "review ai agent for developers",
+    "review ai agent for local businesses",
+    "review ai agent for startups 2026",
+    "review ai agent in 2026",
+    "review ai agent for remote teams",
+    "software ai agent for startups",
+    "software ai agent for small business",
+    "software ai agent for saas",
+    "software ai agent for agencies",
+    "software ai agent for ecommerce",
+    "software ai agent for sales teams",
+    "software ai agent for b2b",
+    "software ai agent for enterprises",
+    "software ai agent for customer support",
+    "software ai agent for marketing teams",
+    "software ai agent for real estate",
+    "software ai agent for recruiters",
+    "software ai agent for hr teams",
+    "software ai agent for healthcare",
+    "software ai agent for finance teams",
+    "software ai agent for travel companies",
+    "software ai agent for developers",
+    "software ai agent for local businesses",
+    "software ai agent for startups 2026",
+    "software ai agent in 2026",
+    "software ai agent for remote teams",
+    "platform ai agent for startups",
+    "platform ai agent for small business",
+    "platform ai agent for saas",
+    "platform ai agent for agencies",
+    "platform ai agent for ecommerce",
+    "platform ai agent for sales teams",
+    "platform ai agent for b2b",
+    "platform ai agent for enterprises",
+    "platform ai agent for customer support",
+    "platform ai agent for marketing teams",
+    "platform ai agent for real estate",
+    "platform ai agent for recruiters",
+    "platform ai agent for hr teams",
+    "platform ai agent for healthcare",
+    "platform ai agent for finance teams",
+    "platform ai agent for travel companies",
+    "platform ai agent for developers",
+    "platform ai agent for local businesses",
+    "platform ai agent for startups 2026",
+    "platform ai agent in 2026",
+    "platform ai agent for remote teams",
+    "solution ai agent for startups",
+    "solution ai agent for small business",
+    "solution ai agent for saas",
+    "solution ai agent for agencies",
+    "solution ai agent for ecommerce",
+    "solution ai agent for sales teams",
+    "solution ai agent for b2b",
+    "solution ai agent for enterprises",
+    "solution ai agent for customer support",
+    "solution ai agent for marketing teams",
+    "solution ai agent for real estate",
+    "solution ai agent for recruiters",
+    "solution ai agent for hr teams",
+    "solution ai agent for healthcare",
+    "solution ai agent for finance teams",
+    "solution ai agent for travel companies",
+    "solution ai agent for developers",
+    "solution ai agent for local businesses",
+    "solution ai agent for startups 2026",
+    "solution ai agent in 2026",
+    "solution ai agent for remote teams",
+    "tool ai agent for startups",
+    "tool ai agent for small business",
+    "tool ai agent for saas",
+    "tool ai agent for agencies",
+    "tool ai agent for ecommerce",
+    "tool ai agent for sales teams",
+    "tool ai agent for b2b",
+    "tool ai agent for enterprises",
+    "tool ai agent for customer support",
+    "tool ai agent for marketing teams",
+    "tool ai agent for real estate",
+    "tool ai agent for recruiters",
+    "tool ai agent for hr teams",
+    "tool ai agent for healthcare",
+    "tool ai agent for finance teams",
+    "tool ai agent for travel companies",
+    "tool ai agent for developers",
+    "tool ai agent for local businesses",
+    "tool ai agent for startups 2026",
+    "tool ai agent in 2026",
+    "tool ai agent for remote teams",
+    "tools ai agent for startups",
+    "tools ai agent for small business",
+    "tools ai agent for saas",
+    "tools ai agent for agencies",
+    "tools ai agent for ecommerce",
+    "tools ai agent for sales teams",
+    "tools ai agent for b2b",
+    "tools ai agent for enterprises",
+    "tools ai agent for customer support",
+    "tools ai agent for marketing teams",
+    "tools ai agent for real estate",
+    "tools ai agent for recruiters",
+    "tools ai agent for hr teams",
+    "tools ai agent for healthcare",
+    "tools ai agent for finance teams",
+    "tools ai agent for travel companies",
+    "tools ai agent for developers",
+    "tools ai agent for local businesses",
+    "tools ai agent for startups 2026",
+    "tools ai agent in 2026",
+    "tools ai agent for remote teams",
+    "provider ai agent for startups",
+    "provider ai agent for small business",
+    "provider ai agent for saas",
+    "provider ai agent for agencies",
+    "provider ai agent for ecommerce",
+    "provider ai agent for sales teams",
+    "provider ai agent for b2b",
+    "provider ai agent for enterprises",
+    "provider ai agent for customer support",
+    "provider ai agent for marketing teams",
+    "provider ai agent for real estate",
+    "provider ai agent for recruiters",
+    "provider ai agent for hr teams",
+    "provider ai agent for healthcare",
+    "provider ai agent for finance teams",
+    "provider ai agent for travel companies",
+    "provider ai agent for developers",
+    "provider ai agent for local businesses",
+    "provider ai agent for startups 2026",
+    "provider ai agent in 2026",
+    "provider ai agent for remote teams",
+    "service ai agent for startups",
+    "service ai agent for small business",
+    "service ai agent for saas",
+    "service ai agent for agencies",
+    "service ai agent for ecommerce",
+    "service ai agent for sales teams",
+    "service ai agent for b2b",
+    "service ai agent for enterprises",
+    "service ai agent for customer support",
+    "service ai agent for marketing teams",
+    "service ai agent for real estate",
+    "service ai agent for recruiters",
+    "service ai agent for hr teams",
+    "service ai agent for healthcare",
+    "service ai agent for finance teams",
+    "service ai agent for travel companies",
+    "service ai agent for developers",
+    "service ai agent for local businesses",
+    "service ai agent for startups 2026",
+    "service ai agent in 2026",
+    "service ai agent for remote teams",
+    "automation ai agent for startups",
+    "automation ai agent for small business",
+    "automation ai agent for saas",
+    "automation ai agent for agencies",
+    "automation ai agent for ecommerce",
+    "automation ai agent for sales teams",
+    "automation ai agent for b2b",
+    "automation ai agent for enterprises",
+    "automation ai agent for customer support",
+    "automation ai agent for marketing teams",
+    "automation ai agent for real estate",
+    "automation ai agent for recruiters",
+    "automation ai agent for hr teams",
+    "automation ai agent for healthcare",
+    "automation ai agent for finance teams",
+    "automation ai agent for travel companies",
+    "automation ai agent for developers",
+    "automation ai agent for local businesses",
+    "automation ai agent for startups 2026",
+    "automation ai agent in 2026",
+    "automation ai agent for remote teams",
+    "best ai agent",
+    "how to use ai agent",
+    "how to choose ai agent",
+    "looking for ai agent",
+    "ai agent recommendations",
+    "ai agent alternatives",
+    "ai agent comparison",
+    "ai agent pricing",
+    "ai agent review",
+    "ai agent for lead generation",
+    "ai agent for customer support",
+    "ai agent for sales",
+    "ai agent for marketing",
+    "ai agent for business automation",
+    "ai agent for appointment booking",
+    "ai agent for outbound outreach",
+    "ai agent for ecommerce",
+    "ai agent for workflow automation",
+    "ai agent for research",
+    "ai agent for business",
+    "need ai agent",
+    "recommend a ai agent",
+    "what is the best ai agent",
+    "which ai agent should i use",
+    "best ai automation for startups",
+    "best ai automation for small business",
+    "best ai automation for saas",
+    "best ai automation for agencies",
+    "best ai automation for ecommerce",
+    "best ai automation for sales teams",
+    "best ai automation for b2b",
+    "best ai automation for enterprises",
+    "best ai automation for customer support",
+    "best ai automation for marketing teams",
+    "best ai automation for real estate",
+    "best ai automation for recruiters",
+    "best ai automation for hr teams",
+    "best ai automation for healthcare",
+    "best ai automation for finance teams",
+    "best ai automation for travel companies",
+    "best ai automation for developers",
+    "best ai automation for local businesses",
+    "best ai automation for startups 2026",
+    "best ai automation in 2026",
+    "best ai automation for remote teams",
+    "top ai automation for startups",
+    "top ai automation for small business",
+    "top ai automation for saas",
+    "top ai automation for agencies",
+    "top ai automation for ecommerce",
+    "top ai automation for sales teams",
+    "top ai automation for b2b",
+    "top ai automation for enterprises",
+    "top ai automation for customer support",
+    "top ai automation for marketing teams",
+    "top ai automation for real estate",
+    "top ai automation for recruiters",
+    "top ai automation for hr teams",
+    "top ai automation for healthcare",
+    "top ai automation for finance teams",
+    "top ai automation for travel companies",
+    "top ai automation for developers",
+    "top ai automation for local businesses",
+    "top ai automation for startups 2026",
+    "top ai automation in 2026",
+    "top ai automation for remote teams",
+    "recommended ai automation for startups",
+    "recommended ai automation for small business",
+    "recommended ai automation for saas",
+    "recommended ai automation for agencies",
+    "recommended ai automation for ecommerce",
+    "recommended ai automation for sales teams",
+    "recommended ai automation for b2b",
+    "recommended ai automation for enterprises",
+    "recommended ai automation for customer support",
+    "recommended ai automation for marketing teams",
+    "recommended ai automation for real estate",
+    "recommended ai automation for recruiters",
+    "recommended ai automation for hr teams",
+    "recommended ai automation for healthcare",
+    "recommended ai automation for finance teams",
+    "recommended ai automation for travel companies",
+    "recommended ai automation for developers",
+    "recommended ai automation for local businesses",
+    "recommended ai automation for startups 2026",
+    "recommended ai automation in 2026",
+    "recommended ai automation for remote teams",
+    "affordable ai automation for startups",
+    "affordable ai automation for small business",
+    "affordable ai automation for saas",
+    "affordable ai automation for agencies",
+    "affordable ai automation for ecommerce",
+    "affordable ai automation for sales teams",
+    "affordable ai automation for b2b",
+    "affordable ai automation for enterprises",
+    "affordable ai automation for customer support",
+    "affordable ai automation for marketing teams",
+    "affordable ai automation for real estate",
+    "affordable ai automation for recruiters",
+    "affordable ai automation for hr teams",
+    "affordable ai automation for healthcare",
+    "affordable ai automation for finance teams",
+    "affordable ai automation for travel companies",
+    "affordable ai automation for developers",
+    "affordable ai automation for local businesses",
+    "affordable ai automation for startups 2026",
+    "affordable ai automation in 2026",
+    "affordable ai automation for remote teams",
+    "enterprise ai automation for startups",
+    "enterprise ai automation for small business",
+    "enterprise ai automation for saas",
+    "enterprise ai automation for agencies",
+    "enterprise ai automation for ecommerce",
+    "enterprise ai automation for sales teams",
+    "enterprise ai automation for b2b",
+    "enterprise ai automation for enterprises",
+    "enterprise ai automation for customer support",
+    "enterprise ai automation for marketing teams",
+    "enterprise ai automation for real estate",
+    "enterprise ai automation for recruiters",
+    "enterprise ai automation for hr teams",
+    "enterprise ai automation for healthcare",
+    "enterprise ai automation for finance teams",
+    "enterprise ai automation for travel companies",
+    "enterprise ai automation for developers",
+    "enterprise ai automation for local businesses",
+    "enterprise ai automation for startups 2026",
+    "enterprise ai automation in 2026",
+    "enterprise ai automation for remote teams",
+    "small business ai automation for startups",
+    "small business ai automation for small business",
+    "small business ai automation for saas",
+    "small business ai automation for agencies",
+    "small business ai automation for ecommerce",
+    "small business ai automation for sales teams",
+    "small business ai automation for b2b",
+    "small business ai automation for enterprises",
+    "small business ai automation for customer support",
+    "small business ai automation for marketing teams",
+    "small business ai automation for real estate",
+    "small business ai automation for recruiters",
+    "small business ai automation for hr teams",
+    "small business ai automation for healthcare",
+    "small business ai automation for finance teams",
+    "small business ai automation for travel companies",
+    "small business ai automation for developers",
+    "small business ai automation for local businesses",
+    "small business ai automation for startups 2026",
+    "small business ai automation in 2026",
+    "small business ai automation for remote teams",
+    "startup ai automation for startups",
+    "startup ai automation for small business",
+    "startup ai automation for saas",
+    "startup ai automation for agencies",
+    "startup ai automation for ecommerce",
+    "startup ai automation for sales teams",
+    "startup ai automation for b2b",
+    "startup ai automation for enterprises",
+    "startup ai automation for customer support",
+    "startup ai automation for marketing teams",
+    "startup ai automation for real estate",
+    "startup ai automation for recruiters",
+    "startup ai automation for hr teams",
+    "startup ai automation for healthcare",
+    "startup ai automation for finance teams",
+    "startup ai automation for travel companies",
+    "startup ai automation for developers",
+    "startup ai automation for local businesses",
+    "startup ai automation for startups 2026",
+    "startup ai automation in 2026",
+    "startup ai automation for remote teams",
+    "alternative ai automation for startups",
+    "alternative ai automation for small business",
+    "alternative ai automation for saas",
+    "alternative ai automation for agencies",
+    "alternative ai automation for ecommerce",
+    "alternative ai automation for sales teams",
+    "alternative ai automation for b2b",
+    "alternative ai automation for enterprises",
+    "alternative ai automation for customer support",
+    "alternative ai automation for marketing teams",
+    "alternative ai automation for real estate",
+    "alternative ai automation for recruiters",
+    "alternative ai automation for hr teams",
+    "alternative ai automation for healthcare",
+    "alternative ai automation for finance teams",
+    "alternative ai automation for travel companies",
+    "alternative ai automation for developers",
+    "alternative ai automation for local businesses",
+    "alternative ai automation for startups 2026",
+    "alternative ai automation in 2026",
+    "alternative ai automation for remote teams",
+    "alternatives ai automation for startups",
+    "alternatives ai automation for small business",
+    "alternatives ai automation for saas",
+    "alternatives ai automation for agencies",
+    "alternatives ai automation for ecommerce",
+    "alternatives ai automation for sales teams",
+    "alternatives ai automation for b2b",
+    "alternatives ai automation for enterprises",
+    "alternatives ai automation for customer support",
+    "alternatives ai automation for marketing teams",
+    "alternatives ai automation for real estate",
+    "alternatives ai automation for recruiters",
+    "alternatives ai automation for hr teams",
+    "alternatives ai automation for healthcare",
+    "alternatives ai automation for finance teams",
+    "alternatives ai automation for travel companies",
+    "alternatives ai automation for developers",
+    "alternatives ai automation for local businesses",
+    "alternatives ai automation for startups 2026",
+    "alternatives ai automation in 2026",
+    "alternatives ai automation for remote teams",
+    "comparison ai automation for startups",
+    "comparison ai automation for small business",
+    "comparison ai automation for saas",
+    "comparison ai automation for agencies",
+    "comparison ai automation for ecommerce",
+    "comparison ai automation for sales teams",
+    "comparison ai automation for b2b",
+    "comparison ai automation for enterprises",
+    "comparison ai automation for customer support",
+    "comparison ai automation for marketing teams",
+    "comparison ai automation for real estate",
+    "comparison ai automation for recruiters",
+    "comparison ai automation for hr teams",
+    "comparison ai automation for healthcare",
+    "comparison ai automation for finance teams",
+    "comparison ai automation for travel companies",
+    "comparison ai automation for developers",
+    "comparison ai automation for local businesses",
+    "comparison ai automation for startups 2026",
+    "comparison ai automation in 2026",
+    "comparison ai automation for remote teams",
+    "vs ai automation for startups",
+    "vs ai automation for small business",
+    "vs ai automation for saas",
+    "vs ai automation for agencies",
+    "vs ai automation for ecommerce",
+    "vs ai automation for sales teams",
+    "vs ai automation for b2b",
+    "vs ai automation for enterprises",
+    "vs ai automation for customer support",
+    "vs ai automation for marketing teams",
+    "vs ai automation for real estate",
+    "vs ai automation for recruiters",
+    "vs ai automation for hr teams",
+    "vs ai automation for healthcare",
+    "vs ai automation for finance teams",
+    "vs ai automation for travel companies",
+    "vs ai automation for developers",
+    "vs ai automation for local businesses",
+    "vs ai automation for startups 2026",
+    "vs ai automation in 2026",
+    "vs ai automation for remote teams",
+    "pricing ai automation for startups",
+    "pricing ai automation for small business",
+    "pricing ai automation for saas",
+    "pricing ai automation for agencies",
+    "pricing ai automation for ecommerce",
+    "pricing ai automation for sales teams",
+    "pricing ai automation for b2b",
+    "pricing ai automation for enterprises",
+    "pricing ai automation for customer support",
+    "pricing ai automation for marketing teams",
+    "pricing ai automation for real estate",
+    "pricing ai automation for recruiters",
+    "pricing ai automation for hr teams",
+    "pricing ai automation for healthcare",
+    "pricing ai automation for finance teams",
+    "pricing ai automation for travel companies",
+    "pricing ai automation for developers",
+    "pricing ai automation for local businesses",
+    "pricing ai automation for startups 2026",
+    "pricing ai automation in 2026",
+    "pricing ai automation for remote teams",
+    "review ai automation for startups",
+    "review ai automation for small business",
+    "review ai automation for saas",
+    "review ai automation for agencies",
+    "review ai automation for ecommerce",
+    "review ai automation for sales teams",
+    "review ai automation for b2b",
+    "review ai automation for enterprises",
+    "review ai automation for customer support",
+    "review ai automation for marketing teams",
+    "review ai automation for real estate",
+    "review ai automation for recruiters",
+    "review ai automation for hr teams",
+    "review ai automation for healthcare",
+    "review ai automation for finance teams",
+    "review ai automation for travel companies",
+    "review ai automation for developers",
+    "review ai automation for local businesses",
+    "review ai automation for startups 2026",
+    "review ai automation in 2026",
+    "review ai automation for remote teams",
+    "software ai automation for startups",
+    "software ai automation for small business",
+    "software ai automation for saas",
+    "software ai automation for agencies",
+    "software ai automation for ecommerce",
+    "software ai automation for sales teams",
+    "software ai automation for b2b",
+    "software ai automation for enterprises",
+    "software ai automation for customer support",
+    "software ai automation for marketing teams",
+    "software ai automation for real estate",
+    "software ai automation for recruiters",
+    "software ai automation for hr teams",
+    "software ai automation for healthcare",
+    "software ai automation for finance teams",
+    "software ai automation for travel companies",
+    "software ai automation for developers",
+    "software ai automation for local businesses",
+    "software ai automation for startups 2026",
+    "software ai automation in 2026",
+    "software ai automation for remote teams",
+    "platform ai automation for startups",
+    "platform ai automation for small business",
+    "platform ai automation for saas",
+    "platform ai automation for agencies",
+    "platform ai automation for ecommerce",
+    "platform ai automation for sales teams",
+    "platform ai automation for b2b",
+    "platform ai automation for enterprises",
+    "platform ai automation for customer support",
+    "platform ai automation for marketing teams",
+    "platform ai automation for real estate",
+    "platform ai automation for recruiters",
+    "platform ai automation for hr teams",
+    "platform ai automation for healthcare",
+    "platform ai automation for finance teams",
+    "platform ai automation for travel companies",
+    "platform ai automation for developers",
+    "platform ai automation for local businesses",
+    "platform ai automation for startups 2026",
+    "platform ai automation in 2026",
+    "platform ai automation for remote teams",
+    "solution ai automation for startups",
+    "solution ai automation for small business",
+    "solution ai automation for saas",
+    "solution ai automation for agencies",
+    "solution ai automation for ecommerce",
+    "solution ai automation for sales teams",
+    "solution ai automation for b2b",
+    "solution ai automation for enterprises",
+    "solution ai automation for customer support",
+    "solution ai automation for marketing teams",
+    "solution ai automation for real estate",
+    "solution ai automation for recruiters",
+    "solution ai automation for hr teams",
+    "solution ai automation for healthcare",
+    "solution ai automation for finance teams",
+    "solution ai automation for travel companies",
+    "solution ai automation for developers",
+    "solution ai automation for local businesses",
+    "solution ai automation for startups 2026",
+    "solution ai automation in 2026",
+    "solution ai automation for remote teams",
+    "tool ai automation for startups",
+    "tool ai automation for small business",
+    "tool ai automation for saas",
+    "tool ai automation for agencies",
+    "tool ai automation for ecommerce",
+    "tool ai automation for sales teams",
+    "tool ai automation for b2b",
+    "tool ai automation for enterprises",
+    "tool ai automation for customer support",
+    "tool ai automation for marketing teams",
+    "tool ai automation for real estate",
+    "tool ai automation for recruiters",
+    "tool ai automation for hr teams",
+    "tool ai automation for healthcare",
+    "tool ai automation for finance teams",
+    "tool ai automation for travel companies",
+    "tool ai automation for developers",
+    "tool ai automation for local businesses",
+    "tool ai automation for startups 2026",
+    "tool ai automation in 2026",
+    "tool ai automation for remote teams",
+    "tools ai automation for startups",
+    "tools ai automation for small business",
+    "tools ai automation for saas",
+    "tools ai automation for agencies",
+    "tools ai automation for ecommerce",
+    "tools ai automation for sales teams",
+    "tools ai automation for b2b",
+    "tools ai automation for enterprises",
+    "tools ai automation for customer support",
+    "tools ai automation for marketing teams",
+    "tools ai automation for real estate",
+    "tools ai automation for recruiters",
+    "tools ai automation for hr teams",
+    "tools ai automation for healthcare",
+    "tools ai automation for finance teams",
+    "tools ai automation for travel companies",
+    "tools ai automation for developers",
+    "tools ai automation for local businesses",
+    "tools ai automation for startups 2026",
+    "tools ai automation in 2026",
+    "tools ai automation for remote teams",
+    "provider ai automation for startups",
+    "provider ai automation for small business",
+    "provider ai automation for saas",
+    "provider ai automation for agencies",
+    "provider ai automation for ecommerce",
+    "provider ai automation for sales teams",
+    "provider ai automation for b2b",
+    "provider ai automation for enterprises",
+    "provider ai automation for customer support",
+    "provider ai automation for marketing teams",
+    "provider ai automation for real estate",
+    "provider ai automation for recruiters",
+    "provider ai automation for hr teams",
+    "provider ai automation for healthcare",
+    "provider ai automation for finance teams",
+    "provider ai automation for travel companies",
+    "provider ai automation for developers",
+    "provider ai automation for local businesses",
+    "provider ai automation for startups 2026",
+    "provider ai automation in 2026",
+    "provider ai automation for remote teams",
+    "service ai automation for startups",
+    "service ai automation for small business",
+    "service ai automation for saas",
+    "service ai automation for agencies",
+    "service ai automation for ecommerce",
+    "service ai automation for sales teams",
+    "service ai automation for b2b",
+    "service ai automation for enterprises",
+    "service ai automation for customer support",
+    "service ai automation for marketing teams",
+    "service ai automation for real estate",
+    "service ai automation for recruiters",
+    "service ai automation for hr teams",
+    "service ai automation for healthcare",
+    "service ai automation for finance teams",
+    "service ai automation for travel companies",
+    "service ai automation for developers",
+    "service ai automation for local businesses",
+    "service ai automation for startups 2026",
+    "service ai automation in 2026",
+    "service ai automation for remote teams",
+    "automation ai automation for startups",
+    "automation ai automation for small business",
+    "automation ai automation for saas",
+    "automation ai automation for agencies",
+    "automation ai automation for ecommerce",
+    "automation ai automation for sales teams",
+    "automation ai automation for b2b",
+    "automation ai automation for enterprises",
+    "automation ai automation for customer support",
+    "automation ai automation for marketing teams",
+    "automation ai automation for real estate",
+    "automation ai automation for recruiters",
+    "automation ai automation for hr teams",
+    "automation ai automation for healthcare",
+    "automation ai automation for finance teams",
+    "automation ai automation for travel companies",
+    "automation ai automation for developers",
+    "automation ai automation for local businesses",
+    "automation ai automation for startups 2026",
+    "automation ai automation in 2026",
+    "automation ai automation for remote teams",
+    "best ai automation",
+    "how to use ai automation",
+    "how to choose ai automation",
+    "looking for ai automation",
+    "ai automation recommendations",
+    "ai automation alternatives",
+    "ai automation comparison",
+    "ai automation pricing",
+    "ai automation review",
+    "ai automation for lead generation",
+    "ai automation for customer support",
+    "ai automation for sales",
+    "ai automation for marketing",
+    "ai automation for business automation",
+    "ai automation for appointment booking",
+    "ai automation for outbound outreach",
+    "ai automation for ecommerce",
+    "ai automation for workflow automation",
+    "ai automation for research",
+    "ai automation for business",
+    "need ai automation",
+    "recommend a ai automation",
+    "what is the best ai automation",
+    "which ai automation should i use",
+    "best ai sales agent for startups",
+    "best ai sales agent for small business",
+    "best ai sales agent for saas",
+    "best ai sales agent for agencies",
+    "best ai sales agent for ecommerce",
+    "best ai sales agent for sales teams",
+    "best ai sales agent for b2b",
+    "best ai sales agent for enterprises",
+    "best ai sales agent for customer support",
+    "best ai sales agent for marketing teams",
+    "best ai sales agent for real estate",
+    "best ai sales agent for recruiters",
+    "best ai sales agent for hr teams",
+    "best ai sales agent for healthcare",
+    "best ai sales agent for finance teams",
+    "best ai sales agent for travel companies",
+    "best ai sales agent for developers",
+    "best ai sales agent for local businesses",
+    "best ai sales agent for startups 2026",
+    "best ai sales agent in 2026",
+    "best ai sales agent for remote teams",
+    "top ai sales agent for startups",
+    "top ai sales agent for small business",
+    "top ai sales agent for saas",
+    "top ai sales agent for agencies",
+    "top ai sales agent for ecommerce",
+    "top ai sales agent for sales teams",
+    "top ai sales agent for b2b",
+    "top ai sales agent for enterprises",
+    "top ai sales agent for customer support",
+    "top ai sales agent for marketing teams",
+    "top ai sales agent for real estate",
+    "top ai sales agent for recruiters",
+    "top ai sales agent for hr teams",
+    "top ai sales agent for healthcare",
+    "top ai sales agent for finance teams",
+    "top ai sales agent for travel companies",
+    "top ai sales agent for developers",
+    "top ai sales agent for local businesses",
+    "top ai sales agent for startups 2026",
+    "top ai sales agent in 2026",
+    "top ai sales agent for remote teams",
+    "recommended ai sales agent for startups",
+    "recommended ai sales agent for small business",
+    "recommended ai sales agent for saas",
+    "recommended ai sales agent for agencies",
+    "recommended ai sales agent for ecommerce",
+    "recommended ai sales agent for sales teams",
+    "recommended ai sales agent for b2b",
+    "recommended ai sales agent for enterprises",
+    "recommended ai sales agent for customer support",
+    "recommended ai sales agent for marketing teams",
+    "recommended ai sales agent for real estate",
+    "recommended ai sales agent for recruiters",
+    "recommended ai sales agent for hr teams",
+    "recommended ai sales agent for healthcare",
+    "recommended ai sales agent for finance teams",
+    "recommended ai sales agent for travel companies",
+    "recommended ai sales agent for developers",
+    "recommended ai sales agent for local businesses",
+    "recommended ai sales agent for startups 2026",
+    "recommended ai sales agent in 2026",
+    "recommended ai sales agent for remote teams",
+    "affordable ai sales agent for startups",
+    "affordable ai sales agent for small business",
+    "affordable ai sales agent for saas",
+    "affordable ai sales agent for agencies",
+    "affordable ai sales agent for ecommerce",
+    "affordable ai sales agent for sales teams",
+    "affordable ai sales agent for b2b",
+    "affordable ai sales agent for enterprises",
+    "affordable ai sales agent for customer support",
+    "affordable ai sales agent for marketing teams",
+    "affordable ai sales agent for real estate",
+    "affordable ai sales agent for recruiters",
+    "affordable ai sales agent for hr teams",
+    "affordable ai sales agent for healthcare",
+    "affordable ai sales agent for finance teams",
+    "affordable ai sales agent for travel companies",
+    "affordable ai sales agent for developers",
+    "affordable ai sales agent for local businesses",
+    "affordable ai sales agent for startups 2026",
+    "affordable ai sales agent in 2026",
+    "affordable ai sales agent for remote teams",
+    "enterprise ai sales agent for startups",
+    "enterprise ai sales agent for small business",
+    "enterprise ai sales agent for saas",
+    "enterprise ai sales agent for agencies",
+    "enterprise ai sales agent for ecommerce",
+    "enterprise ai sales agent for sales teams",
+    "enterprise ai sales agent for b2b",
+    "enterprise ai sales agent for enterprises",
+    "enterprise ai sales agent for customer support",
+    "enterprise ai sales agent for marketing teams",
+    "enterprise ai sales agent for real estate",
+    "enterprise ai sales agent for recruiters",
+    "enterprise ai sales agent for hr teams",
+    "enterprise ai sales agent for healthcare",
+    "enterprise ai sales agent for finance teams",
+    "enterprise ai sales agent for travel companies",
+    "enterprise ai sales agent for developers",
+    "enterprise ai sales agent for local businesses",
+    "enterprise ai sales agent for startups 2026",
+    "enterprise ai sales agent in 2026",
+    "enterprise ai sales agent for remote teams",
+    "small business ai sales agent for startups",
+    "small business ai sales agent for small business",
+    "small business ai sales agent for saas",
+    "small business ai sales agent for agencies",
+    "small business ai sales agent for ecommerce",
+    "small business ai sales agent for sales teams",
+    "small business ai sales agent for b2b",
+    "small business ai sales agent for enterprises",
+    "small business ai sales agent for customer support",
+    "small business ai sales agent for marketing teams",
+    "small business ai sales agent for real estate",
+    "small business ai sales agent for recruiters",
+    "small business ai sales agent for hr teams",
+    "small business ai sales agent for healthcare",
+    "small business ai sales agent for finance teams",
+    "small business ai sales agent for travel companies",
+    "small business ai sales agent for developers",
+    "small business ai sales agent for local businesses",
+    "small business ai sales agent for startups 2026",
+    "small business ai sales agent in 2026",
+    "small business ai sales agent for remote teams",
+    "startup ai sales agent for startups",
+    "startup ai sales agent for small business",
+    "startup ai sales agent for saas",
+    "startup ai sales agent for agencies",
+    "startup ai sales agent for ecommerce",
+    "startup ai sales agent for sales teams",
+    "startup ai sales agent for b2b",
+    "startup ai sales agent for enterprises",
+    "startup ai sales agent for customer support",
+    "startup ai sales agent for marketing teams",
+    "startup ai sales agent for real estate",
+    "startup ai sales agent for recruiters",
+    "startup ai sales agent for hr teams",
+    "startup ai sales agent for healthcare",
+    "startup ai sales agent for finance teams",
+    "startup ai sales agent for travel companies",
+    "startup ai sales agent for developers",
+    "startup ai sales agent for local businesses",
+    "startup ai sales agent for startups 2026",
+    "startup ai sales agent in 2026",
+    "startup ai sales agent for remote teams",
+    "alternative ai sales agent for startups",
+    "alternative ai sales agent for small business",
+    "alternative ai sales agent for saas",
+    "alternative ai sales agent for agencies",
+    "alternative ai sales agent for ecommerce",
+    "alternative ai sales agent for sales teams",
+    "alternative ai sales agent for b2b",
+    "alternative ai sales agent for enterprises",
+    "alternative ai sales agent for customer support",
+    "alternative ai sales agent for marketing teams",
+    "alternative ai sales agent for real estate",
+    "alternative ai sales agent for recruiters",
+    "alternative ai sales agent for hr teams",
+    "alternative ai sales agent for healthcare",
+    "alternative ai sales agent for finance teams",
+    "alternative ai sales agent for travel companies",
+    "alternative ai sales agent for developers",
+    "alternative ai sales agent for local businesses",
+    "alternative ai sales agent for startups 2026",
+    "alternative ai sales agent in 2026",
+    "alternative ai sales agent for remote teams",
+    "alternatives ai sales agent for startups",
+    "alternatives ai sales agent for small business",
+    "alternatives ai sales agent for saas",
+    "alternatives ai sales agent for agencies",
+    "alternatives ai sales agent for ecommerce",
+    "alternatives ai sales agent for sales teams",
+    "alternatives ai sales agent for b2b",
+    "alternatives ai sales agent for enterprises",
+    "alternatives ai sales agent for customer support",
+    "alternatives ai sales agent for marketing teams",
+    "alternatives ai sales agent for real estate",
+    "alternatives ai sales agent for recruiters",
+    "alternatives ai sales agent for hr teams",
+    "alternatives ai sales agent for healthcare",
+    "alternatives ai sales agent for finance teams",
+    "alternatives ai sales agent for travel companies",
+    "alternatives ai sales agent for developers",
+    "alternatives ai sales agent for local businesses",
+    "alternatives ai sales agent for startups 2026",
+    "alternatives ai sales agent in 2026",
+    "alternatives ai sales agent for remote teams",
+    "comparison ai sales agent for startups",
+    "comparison ai sales agent for small business",
+    "comparison ai sales agent for saas",
+    "comparison ai sales agent for agencies",
+    "comparison ai sales agent for ecommerce",
+    "comparison ai sales agent for sales teams",
+    "comparison ai sales agent for b2b",
+    "comparison ai sales agent for enterprises",
+    "comparison ai sales agent for customer support",
+    "comparison ai sales agent for marketing teams",
+    "comparison ai sales agent for real estate",
+    "comparison ai sales agent for recruiters",
+    "comparison ai sales agent for hr teams",
+    "comparison ai sales agent for healthcare",
+    "comparison ai sales agent for finance teams",
+    "comparison ai sales agent for travel companies",
+    "comparison ai sales agent for developers",
+    "comparison ai sales agent for local businesses",
+    "comparison ai sales agent for startups 2026",
+    "comparison ai sales agent in 2026",
+    "comparison ai sales agent for remote teams",
+    "vs ai sales agent for startups",
+    "vs ai sales agent for small business",
+    "vs ai sales agent for saas",
+    "vs ai sales agent for agencies",
+    "vs ai sales agent for ecommerce",
+    "vs ai sales agent for sales teams",
+    "vs ai sales agent for b2b",
+    "vs ai sales agent for enterprises",
+    "vs ai sales agent for customer support",
+    "vs ai sales agent for marketing teams",
+    "vs ai sales agent for real estate",
+    "vs ai sales agent for recruiters",
+    "vs ai sales agent for hr teams",
+    "vs ai sales agent for healthcare",
+    "vs ai sales agent for finance teams",
+    "vs ai sales agent for travel companies",
+    "vs ai sales agent for developers",
+    "vs ai sales agent for local businesses",
+    "vs ai sales agent for startups 2026",
+    "vs ai sales agent in 2026",
+    "vs ai sales agent for remote teams",
+    "pricing ai sales agent for startups",
+    "pricing ai sales agent for small business",
+    "pricing ai sales agent for saas",
+    "pricing ai sales agent for agencies",
+    "pricing ai sales agent for ecommerce",
+    "pricing ai sales agent for sales teams",
+    "pricing ai sales agent for b2b",
+    "pricing ai sales agent for enterprises",
+    "pricing ai sales agent for customer support",
+    "pricing ai sales agent for marketing teams",
+    "pricing ai sales agent for real estate",
+    "pricing ai sales agent for recruiters",
+    "pricing ai sales agent for hr teams",
+    "pricing ai sales agent for healthcare",
+    "pricing ai sales agent for finance teams",
+    "pricing ai sales agent for travel companies",
+    "pricing ai sales agent for developers",
+    "pricing ai sales agent for local businesses",
+    "pricing ai sales agent for startups 2026",
+    "pricing ai sales agent in 2026",
+    "pricing ai sales agent for remote teams",
+    "review ai sales agent for startups",
+    "review ai sales agent for small business",
+    "review ai sales agent for saas",
+    "review ai sales agent for agencies",
+    "review ai sales agent for ecommerce",
+    "review ai sales agent for sales teams",
+    "review ai sales agent for b2b",
+    "review ai sales agent for enterprises",
+    "review ai sales agent for customer support",
+    "review ai sales agent for marketing teams",
+    "review ai sales agent for real estate",
+    "review ai sales agent for recruiters",
+    "review ai sales agent for hr teams",
+    "review ai sales agent for healthcare",
+    "review ai sales agent for finance teams",
+    "review ai sales agent for travel companies",
+    "review ai sales agent for developers",
+    "review ai sales agent for local businesses",
+    "review ai sales agent for startups 2026",
+    "review ai sales agent in 2026",
+    "review ai sales agent for remote teams",
+    "software ai sales agent for startups",
+    "software ai sales agent for small business",
+    "software ai sales agent for saas",
+    "software ai sales agent for agencies",
+    "software ai sales agent for ecommerce",
+    "software ai sales agent for sales teams",
+    "software ai sales agent for b2b",
+    "software ai sales agent for enterprises",
+    "software ai sales agent for customer support",
+    "software ai sales agent for marketing teams",
+    "software ai sales agent for real estate",
+    "software ai sales agent for recruiters",
+    "software ai sales agent for hr teams",
+    "software ai sales agent for healthcare",
+    "software ai sales agent for finance teams",
+    "software ai sales agent for travel companies",
+    "software ai sales agent for developers",
+    "software ai sales agent for local businesses",
+    "software ai sales agent for startups 2026",
+    "software ai sales agent in 2026",
+    "software ai sales agent for remote teams",
+    "platform ai sales agent for startups",
+    "platform ai sales agent for small business",
+    "platform ai sales agent for saas",
+    "platform ai sales agent for agencies",
+    "platform ai sales agent for ecommerce",
+    "platform ai sales agent for sales teams",
+    "platform ai sales agent for b2b",
+    "platform ai sales agent for enterprises",
+    "platform ai sales agent for customer support",
+    "platform ai sales agent for marketing teams",
+    "platform ai sales agent for real estate",
+    "platform ai sales agent for recruiters",
+    "platform ai sales agent for hr teams",
+    "platform ai sales agent for healthcare",
+    "platform ai sales agent for finance teams",
+    "platform ai sales agent for travel companies",
+    "platform ai sales agent for developers",
+    "platform ai sales agent for local businesses",
+    "platform ai sales agent for startups 2026",
+    "platform ai sales agent in 2026",
+    "platform ai sales agent for remote teams",
+    "solution ai sales agent for startups",
+    "solution ai sales agent for small business",
+    "solution ai sales agent for saas",
+    "solution ai sales agent for agencies",
+    "solution ai sales agent for ecommerce",
+    "solution ai sales agent for sales teams",
+    "solution ai sales agent for b2b",
+    "solution ai sales agent for enterprises",
+    "solution ai sales agent for customer support",
+    "solution ai sales agent for marketing teams",
+    "solution ai sales agent for real estate",
+    "solution ai sales agent for recruiters",
+    "solution ai sales agent for hr teams",
+    "solution ai sales agent for healthcare",
+    "solution ai sales agent for finance teams",
+    "solution ai sales agent for travel companies",
+    "solution ai sales agent for developers",
+    "solution ai sales agent for local businesses",
+    "solution ai sales agent for startups 2026",
+    "solution ai sales agent in 2026",
+    "solution ai sales agent for remote teams",
+    "tool ai sales agent for startups",
+    "tool ai sales agent for small business",
+    "tool ai sales agent for saas",
+    "tool ai sales agent for agencies",
+    "tool ai sales agent for ecommerce",
+    "tool ai sales agent for sales teams",
+    "tool ai sales agent for b2b",
+    "tool ai sales agent for enterprises",
+    "tool ai sales agent for customer support",
+    "tool ai sales agent for marketing teams",
+    "tool ai sales agent for real estate",
+    "tool ai sales agent for recruiters",
+    "tool ai sales agent for hr teams",
+    "tool ai sales agent for healthcare",
+    "tool ai sales agent for finance teams",
+    "tool ai sales agent for travel companies",
+    "tool ai sales agent for developers",
+    "tool ai sales agent for local businesses",
+    "tool ai sales agent for startups 2026",
+    "tool ai sales agent in 2026",
+    "tool ai sales agent for remote teams",
+    "tools ai sales agent for startups",
+    "tools ai sales agent for small business",
+    "tools ai sales agent for saas",
+    "tools ai sales agent for agencies",
+    "tools ai sales agent for ecommerce",
+    "tools ai sales agent for sales teams",
+    "tools ai sales agent for b2b",
+    "tools ai sales agent for enterprises",
+    "tools ai sales agent for customer support",
+    "tools ai sales agent for marketing teams",
+    "tools ai sales agent for real estate",
+    "tools ai sales agent for recruiters",
+    "tools ai sales agent for hr teams",
+    "tools ai sales agent for healthcare",
+    "tools ai sales agent for finance teams",
+    "tools ai sales agent for travel companies",
+    "tools ai sales agent for developers",
+    "tools ai sales agent for local businesses",
+    "tools ai sales agent for startups 2026",
+    "tools ai sales agent in 2026",
+    "tools ai sales agent for remote teams",
+    "provider ai sales agent for startups",
+    "provider ai sales agent for small business",
+    "provider ai sales agent for saas",
+    "provider ai sales agent for agencies",
+    "provider ai sales agent for ecommerce",
+    "provider ai sales agent for sales teams",
+    "provider ai sales agent for b2b",
+    "provider ai sales agent for enterprises",
+    "provider ai sales agent for customer support",
+    "provider ai sales agent for marketing teams",
+    "provider ai sales agent for real estate",
+    "provider ai sales agent for recruiters",
+    "provider ai sales agent for hr teams",
+    "provider ai sales agent for healthcare",
+    "provider ai sales agent for finance teams",
+    "provider ai sales agent for travel companies",
+    "provider ai sales agent for developers",
+    "provider ai sales agent for local businesses",
+    "provider ai sales agent for startups 2026",
+    "provider ai sales agent in 2026",
+    "provider ai sales agent for remote teams",
+    "service ai sales agent for startups",
+    "service ai sales agent for small business",
+    "service ai sales agent for saas",
+    "service ai sales agent for agencies",
+    "service ai sales agent for ecommerce",
+    "service ai sales agent for sales teams",
+    "service ai sales agent for b2b",
+    "service ai sales agent for enterprises",
+    "service ai sales agent for customer support",
+    "service ai sales agent for marketing teams",
+    "service ai sales agent for real estate",
+    "service ai sales agent for recruiters",
+    "service ai sales agent for hr teams",
+    "service ai sales agent for healthcare",
+    "service ai sales agent for finance teams",
+    "service ai sales agent for travel companies",
+    "service ai sales agent for developers",
+    "service ai sales agent for local businesses",
+    "service ai sales agent for startups 2026",
+    "service ai sales agent in 2026",
+    "service ai sales agent for remote teams",
+    "automation ai sales agent for startups",
+    "automation ai sales agent for small business",
+    "automation ai sales agent for saas",
+    "automation ai sales agent for agencies",
+    "automation ai sales agent for ecommerce",
+    "automation ai sales agent for sales teams",
+    "automation ai sales agent for b2b",
+    "automation ai sales agent for enterprises",
+    "automation ai sales agent for customer support",
+    "automation ai sales agent for marketing teams",
+    "automation ai sales agent for real estate",
+    "automation ai sales agent for recruiters",
+    "automation ai sales agent for hr teams",
+    "automation ai sales agent for healthcare",
+    "automation ai sales agent for finance teams",
+    "automation ai sales agent for travel companies",
+    "automation ai sales agent for developers",
+    "automation ai sales agent for local businesses",
+    "automation ai sales agent for startups 2026",
+    "automation ai sales agent in 2026",
+    "automation ai sales agent for remote teams",
+    "best ai sales agent",
+    "how to use ai sales agent",
+    "how to choose ai sales agent",
+    "looking for ai sales agent",
+    "ai sales agent recommendations",
+    "ai sales agent alternatives",
+    "ai sales agent comparison",
+    "ai sales agent pricing",
+    "ai sales agent review",
+    "ai sales agent for lead generation",
+    "ai sales agent for customer support",
+    "ai sales agent for sales",
+    "ai sales agent for marketing",
+    "ai sales agent for business automation",
+    "ai sales agent for appointment booking",
+    "ai sales agent for outbound outreach",
+    "ai sales agent for ecommerce",
+    "ai sales agent for workflow automation",
+    "ai sales agent for research",
+    "ai sales agent for business",
+    "need ai sales agent",
+    "recommend a ai sales agent",
+    "what is the best ai sales agent",
+    "which ai sales agent should i use",
+    "best ai customer support agent for startups",
+    "best ai customer support agent for small business",
+    "best ai customer support agent for saas",
+    "best ai customer support agent for agencies",
+    "best ai customer support agent for ecommerce",
+    "best ai customer support agent for sales teams",
+    "best ai customer support agent for b2b",
+    "best ai customer support agent for enterprises",
+    "best ai customer support agent for customer support",
+    "best ai customer support agent for marketing teams",
+    "best ai customer support agent for real estate",
+    "best ai customer support agent for recruiters",
+    "best ai customer support agent for hr teams",
+    "best ai customer support agent for healthcare",
+    "best ai customer support agent for finance teams",
+    "best ai customer support agent for travel companies",
+    "best ai customer support agent for developers",
+    "best ai customer support agent for local businesses",
+    "best ai customer support agent for startups 2026",
+    "best ai customer support agent in 2026",
+    "best ai customer support agent for remote teams",
+    "top ai customer support agent for startups",
+    "top ai customer support agent for small business",
+    "top ai customer support agent for saas",
+    "top ai customer support agent for agencies",
+    "top ai customer support agent for ecommerce",
+    "top ai customer support agent for sales teams",
+    "top ai customer support agent for b2b",
+    "top ai customer support agent for enterprises",
+    "top ai customer support agent for customer support",
+    "top ai customer support agent for marketing teams",
+    "top ai customer support agent for real estate",
+    "top ai customer support agent for recruiters",
+    "top ai customer support agent for hr teams",
+    "top ai customer support agent for healthcare",
+    "top ai customer support agent for finance teams",
+    "top ai customer support agent for travel companies",
+    "top ai customer support agent for developers",
+    "top ai customer support agent for local businesses",
+    "top ai customer support agent for startups 2026",
+    "top ai customer support agent in 2026",
+    "top ai customer support agent for remote teams",
+    "recommended ai customer support agent for startups",
+    "recommended ai customer support agent for small business",
+    "recommended ai customer support agent for saas",
+    "recommended ai customer support agent for agencies",
+    "recommended ai customer support agent for ecommerce",
+    "recommended ai customer support agent for sales teams",
+    "recommended ai customer support agent for b2b",
+    "recommended ai customer support agent for enterprises",
+    "recommended ai customer support agent for customer support",
+    "recommended ai customer support agent for marketing teams",
+    "recommended ai customer support agent for real estate",
+    "recommended ai customer support agent for recruiters",
+    "recommended ai customer support agent for hr teams",
+    "recommended ai customer support agent for healthcare",
+    "recommended ai customer support agent for finance teams",
+    "recommended ai customer support agent for travel companies",
+    "recommended ai customer support agent for developers",
+    "recommended ai customer support agent for local businesses",
+    "recommended ai customer support agent for startups 2026",
+    "recommended ai customer support agent in 2026",
+    "recommended ai customer support agent for remote teams",
+    "affordable ai customer support agent for startups",
+    "affordable ai customer support agent for small business",
+    "affordable ai customer support agent for saas",
+    "affordable ai customer support agent for agencies",
+    "affordable ai customer support agent for ecommerce",
+    "affordable ai customer support agent for sales teams",
+    "affordable ai customer support agent for b2b",
+    "affordable ai customer support agent for enterprises",
+    "affordable ai customer support agent for customer support",
+    "affordable ai customer support agent for marketing teams",
+    "affordable ai customer support agent for real estate",
+    "affordable ai customer support agent for recruiters",
+    "affordable ai customer support agent for hr teams",
+    "affordable ai customer support agent for healthcare",
+    "affordable ai customer support agent for finance teams",
+    "affordable ai customer support agent for travel companies",
+    "affordable ai customer support agent for developers",
+    "affordable ai customer support agent for local businesses",
+    "affordable ai customer support agent for startups 2026",
+    "affordable ai customer support agent in 2026",
+    "affordable ai customer support agent for remote teams",
+    "enterprise ai customer support agent for startups",
+    "enterprise ai customer support agent for small business",
+    "enterprise ai customer support agent for saas",
+    "enterprise ai customer support agent for agencies",
+    "enterprise ai customer support agent for ecommerce",
+    "enterprise ai customer support agent for sales teams",
+    "enterprise ai customer support agent for b2b",
+    "enterprise ai customer support agent for enterprises",
+    "enterprise ai customer support agent for customer support",
+    "enterprise ai customer support agent for marketing teams",
+    "enterprise ai customer support agent for real estate",
+    "enterprise ai customer support agent for recruiters",
+    "enterprise ai customer support agent for hr teams",
+    "enterprise ai customer support agent for healthcare",
+    "enterprise ai customer support agent for finance teams",
+    "enterprise ai customer support agent for travel companies",
+    "enterprise ai customer support agent for developers",
+    "enterprise ai customer support agent for local businesses",
+    "enterprise ai customer support agent for startups 2026",
+    "enterprise ai customer support agent in 2026",
+    "enterprise ai customer support agent for remote teams",
+    "small business ai customer support agent for startups",
+    "small business ai customer support agent for small business",
+    "small business ai customer support agent for saas",
+    "small business ai customer support agent for agencies",
+    "small business ai customer support agent for ecommerce",
+    "small business ai customer support agent for sales teams",
+    "small business ai customer support agent for b2b",
+    "small business ai customer support agent for enterprises",
+    "small business ai customer support agent for customer support",
+    "small business ai customer support agent for marketing teams",
+    "small business ai customer support agent for real estate",
+    "small business ai customer support agent for recruiters",
+    "small business ai customer support agent for hr teams",
+    "small business ai customer support agent for healthcare",
+    "small business ai customer support agent for finance teams",
+    "small business ai customer support agent for travel companies",
+    "small business ai customer support agent for developers",
+    "small business ai customer support agent for local businesses",
+    "small business ai customer support agent for startups 2026",
+    "small business ai customer support agent in 2026",
+    "small business ai customer support agent for remote teams",
+    "startup ai customer support agent for startups",
+    "startup ai customer support agent for small business",
+    "startup ai customer support agent for saas",
+    "startup ai customer support agent for agencies",
+    "startup ai customer support agent for ecommerce",
+    "startup ai customer support agent for sales teams",
+    "startup ai customer support agent for b2b",
+    "startup ai customer support agent for enterprises",
+    "startup ai customer support agent for customer support",
+    "startup ai customer support agent for marketing teams",
+    "startup ai customer support agent for real estate",
+    "startup ai customer support agent for recruiters",
+    "startup ai customer support agent for hr teams",
+    "startup ai customer support agent for healthcare",
+    "startup ai customer support agent for finance teams",
+    "startup ai customer support agent for travel companies",
+    "startup ai customer support agent for developers",
+    "startup ai customer support agent for local businesses",
+    "startup ai customer support agent for startups 2026",
+    "startup ai customer support agent in 2026",
+    "startup ai customer support agent for remote teams",
+    "alternative ai customer support agent for startups",
+    "alternative ai customer support agent for small business",
+    "alternative ai customer support agent for saas",
+    "alternative ai customer support agent for agencies",
+    "alternative ai customer support agent for ecommerce",
+    "alternative ai customer support agent for sales teams",
+    "alternative ai customer support agent for b2b",
+    "alternative ai customer support agent for enterprises",
+    "alternative ai customer support agent for customer support",
+    "alternative ai customer support agent for marketing teams",
+    "alternative ai customer support agent for real estate",
+    "alternative ai customer support agent for recruiters",
+    "alternative ai customer support agent for hr teams",
+    "alternative ai customer support agent for healthcare",
+    "alternative ai customer support agent for finance teams",
+    "alternative ai customer support agent for travel companies",
+    "alternative ai customer support agent for developers",
+    "alternative ai customer support agent for local businesses",
+    "alternative ai customer support agent for startups 2026",
+    "alternative ai customer support agent in 2026",
+    "alternative ai customer support agent for remote teams",
+    "alternatives ai customer support agent for startups",
+    "alternatives ai customer support agent for small business",
+    "alternatives ai customer support agent for saas",
+    "alternatives ai customer support agent for agencies",
+    "alternatives ai customer support agent for ecommerce",
+    "alternatives ai customer support agent for sales teams",
+    "alternatives ai customer support agent for b2b",
+    "alternatives ai customer support agent for enterprises",
+    "alternatives ai customer support agent for customer support",
+    "alternatives ai customer support agent for marketing teams",
+    "alternatives ai customer support agent for real estate",
+    "alternatives ai customer support agent for recruiters",
+    "alternatives ai customer support agent for hr teams",
+    "alternatives ai customer support agent for healthcare",
+    "alternatives ai customer support agent for finance teams",
+    "alternatives ai customer support agent for travel companies",
+    "alternatives ai customer support agent for developers",
+    "alternatives ai customer support agent for local businesses",
+    "alternatives ai customer support agent for startups 2026",
+    "alternatives ai customer support agent in 2026",
+    "alternatives ai customer support agent for remote teams",
+    "comparison ai customer support agent for startups",
+    "comparison ai customer support agent for small business",
+    "comparison ai customer support agent for saas",
+    "comparison ai customer support agent for agencies",
+    "comparison ai customer support agent for ecommerce",
+    "comparison ai customer support agent for sales teams",
+    "comparison ai customer support agent for b2b",
+    "comparison ai customer support agent for enterprises",
+    "comparison ai customer support agent for customer support",
+    "comparison ai customer support agent for marketing teams",
+    "comparison ai customer support agent for real estate",
+    "comparison ai customer support agent for recruiters",
+    "comparison ai customer support agent for hr teams",
+    "comparison ai customer support agent for healthcare",
+    "comparison ai customer support agent for finance teams",
+    "comparison ai customer support agent for travel companies",
+    "comparison ai customer support agent for developers",
+    "comparison ai customer support agent for local businesses",
+    "comparison ai customer support agent for startups 2026",
+    "comparison ai customer support agent in 2026",
+    "comparison ai customer support agent for remote teams",
+    "vs ai customer support agent for startups",
+    "vs ai customer support agent for small business",
+    "vs ai customer support agent for saas",
+    "vs ai customer support agent for agencies",
+    "vs ai customer support agent for ecommerce",
+    "vs ai customer support agent for sales teams",
+    "vs ai customer support agent for b2b",
+    "vs ai customer support agent for enterprises",
+    "vs ai customer support agent for customer support",
+    "vs ai customer support agent for marketing teams",
+    "vs ai customer support agent for real estate",
+    "vs ai customer support agent for recruiters",
+    "vs ai customer support agent for hr teams",
+    "vs ai customer support agent for healthcare",
+    "vs ai customer support agent for finance teams",
+    "vs ai customer support agent for travel companies",
+    "vs ai customer support agent for developers",
+    "vs ai customer support agent for local businesses",
+    "vs ai customer support agent for startups 2026",
+    "vs ai customer support agent in 2026",
+    "vs ai customer support agent for remote teams",
+    "pricing ai customer support agent for startups",
+    "pricing ai customer support agent for small business",
+    "pricing ai customer support agent for saas",
+    "pricing ai customer support agent for agencies",
+    "pricing ai customer support agent for ecommerce",
+    "pricing ai customer support agent for sales teams",
+    "pricing ai customer support agent for b2b",
+    "pricing ai customer support agent for enterprises",
+    "pricing ai customer support agent for customer support",
+    "pricing ai customer support agent for marketing teams",
+    "pricing ai customer support agent for real estate",
+    "pricing ai customer support agent for recruiters",
+    "pricing ai customer support agent for hr teams",
+    "pricing ai customer support agent for healthcare",
+    "pricing ai customer support agent for finance teams",
+    "pricing ai customer support agent for travel companies",
+    "pricing ai customer support agent for developers",
+    "pricing ai customer support agent for local businesses",
+    "pricing ai customer support agent for startups 2026",
+    "pricing ai customer support agent in 2026",
+    "pricing ai customer support agent for remote teams",
+    "review ai customer support agent for startups",
+    "review ai customer support agent for small business",
+    "review ai customer support agent for saas",
+    "review ai customer support agent for agencies",
+    "review ai customer support agent for ecommerce",
+    "review ai customer support agent for sales teams",
+    "review ai customer support agent for b2b",
+    "review ai customer support agent for enterprises",
+    "review ai customer support agent for customer support",
+    "review ai customer support agent for marketing teams",
+    "review ai customer support agent for real estate",
+    "review ai customer support agent for recruiters",
+    "review ai customer support agent for hr teams",
+    "review ai customer support agent for healthcare",
+    "review ai customer support agent for finance teams",
+    "review ai customer support agent for travel companies",
+    "review ai customer support agent for developers",
+    "review ai customer support agent for local businesses",
+    "review ai customer support agent for startups 2026",
+    "review ai customer support agent in 2026",
+    "review ai customer support agent for remote teams",
+    "software ai customer support agent for startups",
+    "software ai customer support agent for small business",
+    "software ai customer support agent for saas",
+    "software ai customer support agent for agencies",
+    "software ai customer support agent for ecommerce",
+    "software ai customer support agent for sales teams",
+    "software ai customer support agent for b2b",
+    "software ai customer support agent for enterprises",
+    "software ai customer support agent for customer support",
+    "software ai customer support agent for marketing teams",
+    "software ai customer support agent for real estate",
+    "software ai customer support agent for recruiters",
+    "software ai customer support agent for hr teams",
+    "software ai customer support agent for healthcare",
+    "software ai customer support agent for finance teams",
+    "software ai customer support agent for travel companies",
+    "software ai customer support agent for developers",
+    "software ai customer support agent for local businesses",
+    "software ai customer support agent for startups 2026",
+    "software ai customer support agent in 2026",
+    "software ai customer support agent for remote teams",
+    "platform ai customer support agent for startups",
+    "platform ai customer support agent for small business",
+    "platform ai customer support agent for saas",
+    "platform ai customer support agent for agencies",
+    "platform ai customer support agent for ecommerce",
+    "platform ai customer support agent for sales teams",
+    "platform ai customer support agent for b2b",
+    "platform ai customer support agent for enterprises",
+    "platform ai customer support agent for customer support",
+    "platform ai customer support agent for marketing teams",
+    "platform ai customer support agent for real estate",
+    "platform ai customer support agent for recruiters",
+    "platform ai customer support agent for hr teams",
+    "platform ai customer support agent for healthcare",
+    "platform ai customer support agent for finance teams",
+    "platform ai customer support agent for travel companies",
+    "platform ai customer support agent for developers",
+    "platform ai customer support agent for local businesses",
+    "platform ai customer support agent for startups 2026",
+    "platform ai customer support agent in 2026",
+    "platform ai customer support agent for remote teams",
+    "solution ai customer support agent for startups",
+    "solution ai customer support agent for small business",
+    "solution ai customer support agent for saas",
+    "solution ai customer support agent for agencies",
+    "solution ai customer support agent for ecommerce",
+    "solution ai customer support agent for sales teams",
+    "solution ai customer support agent for b2b",
+    "solution ai customer support agent for enterprises",
+    "solution ai customer support agent for customer support",
+    "solution ai customer support agent for marketing teams",
+    "solution ai customer support agent for real estate",
+    "solution ai customer support agent for recruiters",
+    "solution ai customer support agent for hr teams",
+    "solution ai customer support agent for healthcare",
+    "solution ai customer support agent for finance teams",
+    "solution ai customer support agent for travel companies",
+    "solution ai customer support agent for developers",
+    "solution ai customer support agent for local businesses",
+    "solution ai customer support agent for startups 2026",
+    "solution ai customer support agent in 2026",
+    "solution ai customer support agent for remote teams",
+    "tool ai customer support agent for startups",
+    "tool ai customer support agent for small business",
+    "tool ai customer support agent for saas",
+    "tool ai customer support agent for agencies",
+    "tool ai customer support agent for ecommerce",
+    "tool ai customer support agent for sales teams",
+    "tool ai customer support agent for b2b",
+    "tool ai customer support agent for enterprises",
+    "tool ai customer support agent for customer support",
+    "tool ai customer support agent for marketing teams",
+    "tool ai customer support agent for real estate",
+    "tool ai customer support agent for recruiters",
+    "tool ai customer support agent for hr teams",
+    "tool ai customer support agent for healthcare",
+    "tool ai customer support agent for finance teams",
+    "tool ai customer support agent for travel companies",
+    "tool ai customer support agent for developers",
+    "tool ai customer support agent for local businesses",
+    "tool ai customer support agent for startups 2026",
+    "tool ai customer support agent in 2026",
+    "tool ai customer support agent for remote teams",
+    "tools ai customer support agent for startups",
+    "tools ai customer support agent for small business",
+    "tools ai customer support agent for saas",
+    "tools ai customer support agent for agencies",
+    "tools ai customer support agent for ecommerce",
+    "tools ai customer support agent for sales teams",
+    "tools ai customer support agent for b2b",
+    "tools ai customer support agent for enterprises",
+    "tools ai customer support agent for customer support",
+    "tools ai customer support agent for marketing teams",
+    "tools ai customer support agent for real estate",
+    "tools ai customer support agent for recruiters",
+    "tools ai customer support agent for hr teams",
+    "tools ai customer support agent for healthcare",
+    "tools ai customer support agent for finance teams",
+    "tools ai customer support agent for travel companies",
+    "tools ai customer support agent for developers",
+    "tools ai customer support agent for local businesses",
+    "tools ai customer support agent for startups 2026",
+    "tools ai customer support agent in 2026",
+    "tools ai customer support agent for remote teams",
+    "provider ai customer support agent for startups",
+    "provider ai customer support agent for small business",
+    "provider ai customer support agent for saas",
+    "provider ai customer support agent for agencies",
+    "provider ai customer support agent for ecommerce",
+    "provider ai customer support agent for sales teams",
+    "provider ai customer support agent for b2b",
+    "provider ai customer support agent for enterprises",
+    "provider ai customer support agent for customer support",
+    "provider ai customer support agent for marketing teams",
+    "provider ai customer support agent for real estate",
+    "provider ai customer support agent for recruiters",
+    "provider ai customer support agent for hr teams",
+    "provider ai customer support agent for healthcare",
+    "provider ai customer support agent for finance teams",
+    "provider ai customer support agent for travel companies",
+    "provider ai customer support agent for developers",
+    "provider ai customer support agent for local businesses",
+    "provider ai customer support agent for startups 2026",
+    "provider ai customer support agent in 2026",
+    "provider ai customer support agent for remote teams",
+    "service ai customer support agent for startups",
+    "service ai customer support agent for small business",
+    "service ai customer support agent for saas",
+    "service ai customer support agent for agencies",
+    "service ai customer support agent for ecommerce",
+    "service ai customer support agent for sales teams",
+    "service ai customer support agent for b2b",
+    "service ai customer support agent for enterprises",
+    "service ai customer support agent for customer support",
+    "service ai customer support agent for marketing teams",
+    "service ai customer support agent for real estate",
+    "service ai customer support agent for recruiters",
+    "service ai customer support agent for hr teams",
+    "service ai customer support agent for healthcare",
+    "service ai customer support agent for finance teams",
+    "service ai customer support agent for travel companies",
+    "service ai customer support agent for developers",
+    "service ai customer support agent for local businesses",
+    "service ai customer support agent for startups 2026",
+    "service ai customer support agent in 2026",
+    "service ai customer support agent for remote teams",
+    "automation ai customer support agent for startups",
+    "automation ai customer support agent for small business",
+    "automation ai customer support agent for saas",
+    "automation ai customer support agent for agencies",
+    "automation ai customer support agent for ecommerce",
+    "automation ai customer support agent for sales teams",
+    "automation ai customer support agent for b2b",
+    "automation ai customer support agent for enterprises",
+    "automation ai customer support agent for customer support",
+    "automation ai customer support agent for marketing teams",
+    "automation ai customer support agent for real estate",
+    "automation ai customer support agent for recruiters",
+    "automation ai customer support agent for hr teams",
+    "automation ai customer support agent for healthcare",
+    "automation ai customer support agent for finance teams",
+    "automation ai customer support agent for travel companies",
+    "automation ai customer support agent for developers",
+    "automation ai customer support agent for local businesses",
+    "automation ai customer support agent for startups 2026",
+    "automation ai customer support agent in 2026",
+    "automation ai customer support agent for remote teams",
+    "best ai customer support agent",
+    "how to use ai customer support agent",
+    "how to choose ai customer support agent",
+    "looking for ai customer support agent",
+    "ai customer support agent recommendations",
+    "ai customer support agent alternatives",
+    "ai customer support agent comparison",
+    "ai customer support agent pricing",
+    "ai customer support agent review",
+    "ai customer support agent for lead generation",
+    "ai customer support agent for customer support",
+    "ai customer support agent for sales",
+    "ai customer support agent for marketing",
+    "ai customer support agent for business automation",
+    "ai customer support agent for appointment booking",
+    "ai customer support agent for outbound outreach",
+    "ai customer support agent for ecommerce",
+    "ai customer support agent for workflow automation",
+    "ai customer support agent for research",
+    "ai customer support agent for business",
+    "need ai customer support agent",
+    "recommend a ai customer support agent",
+    "what is the best ai customer support agent",
+    "which ai customer support agent should i use",
+    "best ai voice agent for startups",
+    "best ai voice agent for small business",
+    "best ai voice agent for saas",
+    "best ai voice agent for agencies",
+    "best ai voice agent for ecommerce",
+    "best ai voice agent for sales teams",
+    "best ai voice agent for b2b",
+    "best ai voice agent for enterprises",
+    "best ai voice agent for customer support",
+    "best ai voice agent for marketing teams",
+    "best ai voice agent for real estate",
+    "best ai voice agent for recruiters",
+    "best ai voice agent for hr teams",
+    "best ai voice agent for healthcare",
+    "best ai voice agent for finance teams",
+    "best ai voice agent for travel companies",
+    "best ai voice agent for developers",
+    "best ai voice agent for local businesses",
+    "best ai voice agent for startups 2026",
+    "best ai voice agent in 2026",
+    "best ai voice agent for remote teams",
+    "top ai voice agent for startups",
+    "top ai voice agent for small business",
+    "top ai voice agent for saas",
+    "top ai voice agent for agencies",
+    "top ai voice agent for ecommerce",
+    "top ai voice agent for sales teams",
+    "top ai voice agent for b2b",
+    "top ai voice agent for enterprises",
+    "top ai voice agent for customer support",
+    "top ai voice agent for marketing teams",
+    "top ai voice agent for real estate",
+    "top ai voice agent for recruiters",
+    "top ai voice agent for hr teams",
+    "top ai voice agent for healthcare",
+    "top ai voice agent for finance teams",
+    "top ai voice agent for travel companies",
+    "top ai voice agent for developers",
+    "top ai voice agent for local businesses",
+    "top ai voice agent for startups 2026",
+    "top ai voice agent in 2026",
+    "top ai voice agent for remote teams",
+    "recommended ai voice agent for startups",
+    "recommended ai voice agent for small business",
+    "recommended ai voice agent for saas",
+    "recommended ai voice agent for agencies",
+    "recommended ai voice agent for ecommerce",
+    "recommended ai voice agent for sales teams",
+    "recommended ai voice agent for b2b",
+    "recommended ai voice agent for enterprises",
+    "recommended ai voice agent for customer support",
+    "recommended ai voice agent for marketing teams",
+    "recommended ai voice agent for real estate",
+    "recommended ai voice agent for recruiters",
+    "recommended ai voice agent for hr teams",
+    "recommended ai voice agent for healthcare",
+    "recommended ai voice agent for finance teams",
+    "recommended ai voice agent for travel companies",
+    "recommended ai voice agent for developers",
+    "recommended ai voice agent for local businesses",
+    "recommended ai voice agent for startups 2026",
+    "recommended ai voice agent in 2026",
+    "recommended ai voice agent for remote teams",
+    "affordable ai voice agent for startups",
+    "affordable ai voice agent for small business",
+    "affordable ai voice agent for saas",
+    "affordable ai voice agent for agencies",
+    "affordable ai voice agent for ecommerce",
+    "affordable ai voice agent for sales teams",
+    "affordable ai voice agent for b2b",
+    "affordable ai voice agent for enterprises",
+    "affordable ai voice agent for customer support",
+    "affordable ai voice agent for marketing teams",
+    "affordable ai voice agent for real estate",
+    "affordable ai voice agent for recruiters",
+    "affordable ai voice agent for hr teams",
+    "affordable ai voice agent for healthcare",
+    "affordable ai voice agent for finance teams",
+    "affordable ai voice agent for travel companies",
+    "affordable ai voice agent for developers",
+    "affordable ai voice agent for local businesses",
+    "affordable ai voice agent for startups 2026",
+    "affordable ai voice agent in 2026",
+    "affordable ai voice agent for remote teams",
+    "enterprise ai voice agent for startups",
+    "enterprise ai voice agent for small business",
+    "enterprise ai voice agent for saas",
+    "enterprise ai voice agent for agencies",
+    "enterprise ai voice agent for ecommerce",
+    "enterprise ai voice agent for sales teams",
+    "enterprise ai voice agent for b2b",
+    "enterprise ai voice agent for enterprises",
+    "enterprise ai voice agent for customer support",
+    "enterprise ai voice agent for marketing teams",
+    "enterprise ai voice agent for real estate",
+    "enterprise ai voice agent for recruiters",
+    "enterprise ai voice agent for hr teams",
+    "enterprise ai voice agent for healthcare",
+    "enterprise ai voice agent for finance teams",
+    "enterprise ai voice agent for travel companies",
+    "enterprise ai voice agent for developers",
+    "enterprise ai voice agent for local businesses",
+    "enterprise ai voice agent for startups 2026",
+    "enterprise ai voice agent in 2026",
+    "enterprise ai voice agent for remote teams",
+    "small business ai voice agent for startups",
+    "small business ai voice agent for small business",
+    "small business ai voice agent for saas",
+    "small business ai voice agent for agencies",
+    "small business ai voice agent for ecommerce",
+    "small business ai voice agent for sales teams",
+    "small business ai voice agent for b2b",
+    "small business ai voice agent for enterprises",
+    "small business ai voice agent for customer support",
+    "small business ai voice agent for marketing teams",
+    "small business ai voice agent for real estate",
+    "small business ai voice agent for recruiters",
+    "small business ai voice agent for hr teams",
+    "small business ai voice agent for healthcare",
+    "small business ai voice agent for finance teams",
+    "small business ai voice agent for travel companies",
+    "small business ai voice agent for developers",
+    "small business ai voice agent for local businesses",
+    "small business ai voice agent for startups 2026",
+    "small business ai voice agent in 2026",
+    "small business ai voice agent for remote teams",
+    "startup ai voice agent for startups",
+    "startup ai voice agent for small business",
+    "startup ai voice agent for saas",
+    "startup ai voice agent for agencies",
+    "startup ai voice agent for ecommerce",
+    "startup ai voice agent for sales teams",
+    "startup ai voice agent for b2b",
+    "startup ai voice agent for enterprises",
+    "startup ai voice agent for customer support",
+    "startup ai voice agent for marketing teams",
+    "startup ai voice agent for real estate",
+    "startup ai voice agent for recruiters",
+    "startup ai voice agent for hr teams",
+    "startup ai voice agent for healthcare",
+    "startup ai voice agent for finance teams",
+    "startup ai voice agent for travel companies",
+    "startup ai voice agent for developers",
+    "startup ai voice agent for local businesses",
+    "startup ai voice agent for startups 2026",
+    "startup ai voice agent in 2026",
+    "startup ai voice agent for remote teams",
+    "alternative ai voice agent for startups",
+    "alternative ai voice agent for small business",
+    "alternative ai voice agent for saas",
+    "alternative ai voice agent for agencies",
+    "alternative ai voice agent for ecommerce",
+    "alternative ai voice agent for sales teams",
+    "alternative ai voice agent for b2b",
+    "alternative ai voice agent for enterprises",
+    "alternative ai voice agent for customer support",
+    "alternative ai voice agent for marketing teams",
+    "alternative ai voice agent for real estate",
+    "alternative ai voice agent for recruiters",
+    "alternative ai voice agent for hr teams",
+    "alternative ai voice agent for healthcare",
+    "alternative ai voice agent for finance teams",
+    "alternative ai voice agent for travel companies",
+    "alternative ai voice agent for developers",
+    "alternative ai voice agent for local businesses",
+    "alternative ai voice agent for startups 2026",
+    "alternative ai voice agent in 2026",
+    "alternative ai voice agent for remote teams",
+    "alternatives ai voice agent for startups",
+    "alternatives ai voice agent for small business",
+    "alternatives ai voice agent for saas",
+    "alternatives ai voice agent for agencies",
+    "alternatives ai voice agent for ecommerce",
+    "alternatives ai voice agent for sales teams",
+    "alternatives ai voice agent for b2b",
+    "alternatives ai voice agent for enterprises",
+    "alternatives ai voice agent for customer support",
+    "alternatives ai voice agent for marketing teams",
+    "alternatives ai voice agent for real estate",
+    "alternatives ai voice agent for recruiters",
+    "alternatives ai voice agent for hr teams",
+    "alternatives ai voice agent for healthcare",
+    "alternatives ai voice agent for finance teams",
+    "alternatives ai voice agent for travel companies",
+    "alternatives ai voice agent for developers",
+    "alternatives ai voice agent for local businesses",
+    "alternatives ai voice agent for startups 2026",
+    "alternatives ai voice agent in 2026",
+    "alternatives ai voice agent for remote teams",
+    "comparison ai voice agent for startups",
+    "comparison ai voice agent for small business",
+    "comparison ai voice agent for saas",
+    "comparison ai voice agent for agencies",
+    "comparison ai voice agent for ecommerce",
+    "comparison ai voice agent for sales teams",
+    "comparison ai voice agent for b2b",
+    "comparison ai voice agent for enterprises",
+    "comparison ai voice agent for customer support",
+    "comparison ai voice agent for marketing teams",
+    "comparison ai voice agent for real estate",
+    "comparison ai voice agent for recruiters",
+    "comparison ai voice agent for hr teams",
+    "comparison ai voice agent for healthcare",
+    "comparison ai voice agent for finance teams",
+    "comparison ai voice agent for travel companies",
+    "comparison ai voice agent for developers",
+    "comparison ai voice agent for local businesses",
+    "comparison ai voice agent for startups 2026",
+    "comparison ai voice agent in 2026",
+    "comparison ai voice agent for remote teams",
+    "vs ai voice agent for startups",
+    "vs ai voice agent for small business",
+    "vs ai voice agent for saas",
+    "vs ai voice agent for agencies",
+    "vs ai voice agent for ecommerce",
+    "vs ai voice agent for sales teams",
+    "vs ai voice agent for b2b",
+    "vs ai voice agent for enterprises",
+    "vs ai voice agent for customer support",
+    "vs ai voice agent for marketing teams",
+    "vs ai voice agent for real estate",
+    "vs ai voice agent for recruiters",
+    "vs ai voice agent for hr teams",
+    "vs ai voice agent for healthcare",
+    "vs ai voice agent for finance teams",
+    "vs ai voice agent for travel companies",
+    "vs ai voice agent for developers",
+    "vs ai voice agent for local businesses",
+    "vs ai voice agent for startups 2026",
+    "vs ai voice agent in 2026",
+    "vs ai voice agent for remote teams",
+    "pricing ai voice agent for startups",
+    "pricing ai voice agent for small business",
+    "pricing ai voice agent for saas",
+    "pricing ai voice agent for agencies",
+    "pricing ai voice agent for ecommerce",
+    "pricing ai voice agent for sales teams",
+    "pricing ai voice agent for b2b",
+    "pricing ai voice agent for enterprises",
+    "pricing ai voice agent for customer support",
+    "pricing ai voice agent for marketing teams",
+    "pricing ai voice agent for real estate",
+    "pricing ai voice agent for recruiters",
+    "pricing ai voice agent for hr teams",
+    "pricing ai voice agent for healthcare",
+    "pricing ai voice agent for finance teams",
+    "pricing ai voice agent for travel companies",
+    "pricing ai voice agent for developers",
+    "pricing ai voice agent for local businesses",
+    "pricing ai voice agent for startups 2026",
+    "pricing ai voice agent in 2026",
+    "pricing ai voice agent for remote teams",
+    "review ai voice agent for startups",
+    "review ai voice agent for small business",
+    "review ai voice agent for saas",
+    "review ai voice agent for agencies",
+    "review ai voice agent for ecommerce",
+    "review ai voice agent for sales teams",
+    "review ai voice agent for b2b",
+    "review ai voice agent for enterprises",
+    "review ai voice agent for customer support",
+    "review ai voice agent for marketing teams",
+    "review ai voice agent for real estate",
+    "review ai voice agent for recruiters",
+    "review ai voice agent for hr teams",
+    "review ai voice agent for healthcare",
+    "review ai voice agent for finance teams",
+    "review ai voice agent for travel companies",
+    "review ai voice agent for developers",
+    "review ai voice agent for local businesses",
+    "review ai voice agent for startups 2026",
+    "review ai voice agent in 2026",
+    "review ai voice agent for remote teams",
+    "software ai voice agent for startups",
+    "software ai voice agent for small business",
+    "software ai voice agent for saas",
+    "software ai voice agent for agencies",
+    "software ai voice agent for ecommerce",
+    "software ai voice agent for sales teams",
+    "software ai voice agent for b2b",
+    "software ai voice agent for enterprises",
+    "software ai voice agent for customer support",
+    "software ai voice agent for marketing teams",
+    "software ai voice agent for real estate",
+    "software ai voice agent for recruiters",
+    "software ai voice agent for hr teams",
+    "software ai voice agent for healthcare",
+    "software ai voice agent for finance teams",
+    "software ai voice agent for travel companies",
+    "software ai voice agent for developers",
+    "software ai voice agent for local businesses",
+    "software ai voice agent for startups 2026",
+    "software ai voice agent in 2026",
+    "software ai voice agent for remote teams",
+    "platform ai voice agent for startups",
+    "platform ai voice agent for small business",
+    "platform ai voice agent for saas",
+    "platform ai voice agent for agencies",
+    "platform ai voice agent for ecommerce",
+    "platform ai voice agent for sales teams",
+    "platform ai voice agent for b2b",
+    "platform ai voice agent for enterprises",
+    "platform ai voice agent for customer support",
+    "platform ai voice agent for marketing teams",
+    "platform ai voice agent for real estate",
+    "platform ai voice agent for recruiters",
+    "platform ai voice agent for hr teams",
+    "platform ai voice agent for healthcare",
+    "platform ai voice agent for finance teams",
+    "platform ai voice agent for travel companies",
+    "platform ai voice agent for developers",
+    "platform ai voice agent for local businesses",
+    "platform ai voice agent for startups 2026",
+    "platform ai voice agent in 2026",
+    "platform ai voice agent for remote teams",
+    "solution ai voice agent for startups",
+    "solution ai voice agent for small business",
+    "solution ai voice agent for saas",
+    "solution ai voice agent for agencies",
+    "solution ai voice agent for ecommerce",
+    "solution ai voice agent for sales teams",
+    "solution ai voice agent for b2b",
+    "solution ai voice agent for enterprises",
+    "solution ai voice agent for customer support",
+    "solution ai voice agent for marketing teams",
+    "solution ai voice agent for real estate",
+    "solution ai voice agent for recruiters",
+    "solution ai voice agent for hr teams",
+    "solution ai voice agent for healthcare",
+    "solution ai voice agent for finance teams",
+    "solution ai voice agent for travel companies",
+    "solution ai voice agent for developers",
+    "solution ai voice agent for local businesses",
+    "solution ai voice agent for startups 2026",
+    "solution ai voice agent in 2026",
+    "solution ai voice agent for remote teams",
+    "tool ai voice agent for startups",
+    "tool ai voice agent for small business",
+    "tool ai voice agent for saas",
+    "tool ai voice agent for agencies",
+    "tool ai voice agent for ecommerce",
+    "tool ai voice agent for sales teams",
+    "tool ai voice agent for b2b",
+    "tool ai voice agent for enterprises",
+    "tool ai voice agent for customer support",
+    "tool ai voice agent for marketing teams",
+    "tool ai voice agent for real estate",
+    "tool ai voice agent for recruiters",
+    "tool ai voice agent for hr teams",
+    "tool ai voice agent for healthcare",
+    "tool ai voice agent for finance teams",
+    "tool ai voice agent for travel companies",
+    "tool ai voice agent for developers",
+    "tool ai voice agent for local businesses",
+    "tool ai voice agent for startups 2026",
+    "tool ai voice agent in 2026",
+    "tool ai voice agent for remote teams",
+    "tools ai voice agent for startups",
+    "tools ai voice agent for small business",
+    "tools ai voice agent for saas",
+    "tools ai voice agent for agencies",
+    "tools ai voice agent for ecommerce",
+    "tools ai voice agent for sales teams",
+    "tools ai voice agent for b2b",
+    "tools ai voice agent for enterprises",
+    "tools ai voice agent for customer support",
+    "tools ai voice agent for marketing teams",
+    "tools ai voice agent for real estate",
+    "tools ai voice agent for recruiters",
+    "tools ai voice agent for hr teams",
+    "tools ai voice agent for healthcare",
+    "tools ai voice agent for finance teams",
+    "tools ai voice agent for travel companies",
+    "tools ai voice agent for developers",
+    "tools ai voice agent for local businesses",
+    "tools ai voice agent for startups 2026",
+    "tools ai voice agent in 2026",
+    "tools ai voice agent for remote teams",
+    "provider ai voice agent for startups",
+    "provider ai voice agent for small business",
+    "provider ai voice agent for saas",
+    "provider ai voice agent for agencies",
+    "provider ai voice agent for ecommerce",
+    "provider ai voice agent for sales teams",
+    "provider ai voice agent for b2b",
+    "provider ai voice agent for enterprises",
+    "provider ai voice agent for customer support",
+    "provider ai voice agent for marketing teams",
+    "provider ai voice agent for real estate",
+    "provider ai voice agent for recruiters",
+    "provider ai voice agent for hr teams",
+    "provider ai voice agent for healthcare",
+    "provider ai voice agent for finance teams",
+    "provider ai voice agent for travel companies",
+    "provider ai voice agent for developers",
+    "provider ai voice agent for local businesses",
+    "provider ai voice agent for startups 2026",
+    "provider ai voice agent in 2026",
+    "provider ai voice agent for remote teams",
+    "service ai voice agent for startups",
+    "service ai voice agent for small business",
+    "service ai voice agent for saas",
+    "service ai voice agent for agencies",
+    "service ai voice agent for ecommerce",
+    "service ai voice agent for sales teams",
+    "service ai voice agent for b2b",
+    "service ai voice agent for enterprises",
+    "service ai voice agent for customer support",
+    "service ai voice agent for marketing teams",
+    "service ai voice agent for real estate",
+    "service ai voice agent for recruiters",
+    "service ai voice agent for hr teams",
+    "service ai voice agent for healthcare",
+    "service ai voice agent for finance teams",
+    "service ai voice agent for travel companies",
+    "service ai voice agent for developers",
+    "service ai voice agent for local businesses",
+    "service ai voice agent for startups 2026",
+    "service ai voice agent in 2026",
+    "service ai voice agent for remote teams",
+    "automation ai voice agent for startups",
+    "automation ai voice agent for small business",
+    "automation ai voice agent for saas",
+    "automation ai voice agent for agencies",
+    "automation ai voice agent for ecommerce",
+    "automation ai voice agent for sales teams",
+    "automation ai voice agent for b2b",
+    "automation ai voice agent for enterprises",
+    "automation ai voice agent for customer support",
+    "automation ai voice agent for marketing teams",
+    "automation ai voice agent for real estate",
+    "automation ai voice agent for recruiters",
+    "automation ai voice agent for hr teams",
+    "automation ai voice agent for healthcare",
+    "automation ai voice agent for finance teams",
+    "automation ai voice agent for travel companies",
+    "automation ai voice agent for developers",
+    "automation ai voice agent for local businesses",
+    "automation ai voice agent for startups 2026",
+    "automation ai voice agent in 2026",
+    "automation ai voice agent for remote teams",
+    "best ai voice agent",
+    "how to use ai voice agent",
+    "how to choose ai voice agent",
+    "looking for ai voice agent",
+    "ai voice agent recommendations",
+    "ai voice agent alternatives",
+    "ai voice agent comparison",
+    "ai voice agent pricing",
+    "ai voice agent review",
+    "ai voice agent for lead generation",
+    "ai voice agent for customer support",
+    "ai voice agent for sales",
+    "ai voice agent for marketing",
+    "ai voice agent for business automation",
+    "ai voice agent for appointment booking",
+    "ai voice agent for outbound outreach",
+    "ai voice agent for ecommerce",
+    "ai voice agent for workflow automation",
+    "ai voice agent for research",
+    "ai voice agent for business",
+    "need ai voice agent",
+    "recommend a ai voice agent",
+    "what is the best ai voice agent",
+    "which ai voice agent should i use",
+    "best ai marketing agent for startups",
+    "best ai marketing agent for small business",
+    "best ai marketing agent for saas",
+    "best ai marketing agent for agencies",
+    "best ai marketing agent for ecommerce",
+    "best ai marketing agent for sales teams",
+    "best ai marketing agent for b2b",
+    "best ai marketing agent for enterprises",
+    "best ai marketing agent for customer support",
+    "best ai marketing agent for marketing teams",
+    "best ai marketing agent for real estate",
+    "best ai marketing agent for recruiters",
+    "best ai marketing agent for hr teams",
+    "best ai marketing agent for healthcare",
+    "best ai marketing agent for finance teams",
+    "best ai marketing agent for travel companies",
+    "best ai marketing agent for developers",
+    "best ai marketing agent for local businesses",
+    "best ai marketing agent for startups 2026",
+    "best ai marketing agent in 2026",
+    "best ai marketing agent for remote teams",
+    "top ai marketing agent for startups",
+    "top ai marketing agent for small business",
+    "top ai marketing agent for saas",
+    "top ai marketing agent for agencies",
+    "top ai marketing agent for ecommerce",
+    "top ai marketing agent for sales teams",
+    "top ai marketing agent for b2b",
+    "top ai marketing agent for enterprises",
+    "top ai marketing agent for customer support",
+    "top ai marketing agent for marketing teams",
+    "top ai marketing agent for real estate",
+    "top ai marketing agent for recruiters",
+    "top ai marketing agent for hr teams",
+    "top ai marketing agent for healthcare",
+    "top ai marketing agent for finance teams",
+    "top ai marketing agent for travel companies",
+    "top ai marketing agent for developers",
+    "top ai marketing agent for local businesses",
+    "top ai marketing agent for startups 2026",
+    "top ai marketing agent in 2026",
+    "top ai marketing agent for remote teams",
+    "recommended ai marketing agent for startups",
+    "recommended ai marketing agent for small business",
+    "recommended ai marketing agent for saas",
+    "recommended ai marketing agent for agencies",
+    "recommended ai marketing agent for ecommerce",
+    "recommended ai marketing agent for sales teams",
+    "recommended ai marketing agent for b2b",
+    "recommended ai marketing agent for enterprises",
+    "recommended ai marketing agent for customer support",
+    "recommended ai marketing agent for marketing teams",
+    "recommended ai marketing agent for real estate",
+    "recommended ai marketing agent for recruiters",
+    "recommended ai marketing agent for hr teams",
+    "recommended ai marketing agent for healthcare",
+    "recommended ai marketing agent for finance teams",
+    "recommended ai marketing agent for travel companies",
+    "recommended ai marketing agent for developers",
+    "recommended ai marketing agent for local businesses",
+    "recommended ai marketing agent for startups 2026",
+    "recommended ai marketing agent in 2026",
+    "recommended ai marketing agent for remote teams",
+    "affordable ai marketing agent for startups",
+    "affordable ai marketing agent for small business",
+    "affordable ai marketing agent for saas",
+    "affordable ai marketing agent for agencies",
+    "affordable ai marketing agent for ecommerce",
+    "affordable ai marketing agent for sales teams",
+    "affordable ai marketing agent for b2b",
+    "affordable ai marketing agent for enterprises",
+    "affordable ai marketing agent for customer support",
+    "affordable ai marketing agent for marketing teams",
+    "affordable ai marketing agent for real estate",
+    "affordable ai marketing agent for recruiters",
+    "affordable ai marketing agent for hr teams",
+    "affordable ai marketing agent for healthcare",
+    "affordable ai marketing agent for finance teams",
+    "affordable ai marketing agent for travel companies",
+    "affordable ai marketing agent for developers",
+    "affordable ai marketing agent for local businesses",
+    "affordable ai marketing agent for startups 2026",
+    "affordable ai marketing agent in 2026",
+    "affordable ai marketing agent for remote teams",
+    "enterprise ai marketing agent for startups",
+    "enterprise ai marketing agent for small business",
+    "enterprise ai marketing agent for saas",
+    "enterprise ai marketing agent for agencies",
+    "enterprise ai marketing agent for ecommerce",
+    "enterprise ai marketing agent for sales teams",
+    "enterprise ai marketing agent for b2b",
+    "enterprise ai marketing agent for enterprises",
+    "enterprise ai marketing agent for customer support",
+    "enterprise ai marketing agent for marketing teams",
+    "enterprise ai marketing agent for real estate",
+    "enterprise ai marketing agent for recruiters",
+    "enterprise ai marketing agent for hr teams",
+    "enterprise ai marketing agent for healthcare",
+    "enterprise ai marketing agent for finance teams",
+    "enterprise ai marketing agent for travel companies",
+    "enterprise ai marketing agent for developers",
+    "enterprise ai marketing agent for local businesses",
+    "enterprise ai marketing agent for startups 2026",
+    "enterprise ai marketing agent in 2026",
+    "enterprise ai marketing agent for remote teams",
+    "small business ai marketing agent for startups",
+    "small business ai marketing agent for small business",
+    "small business ai marketing agent for saas",
+    "small business ai marketing agent for agencies",
+    "small business ai marketing agent for ecommerce",
+    "small business ai marketing agent for sales teams",
+    "small business ai marketing agent for b2b",
+    "small business ai marketing agent for enterprises",
+    "small business ai marketing agent for customer support",
+    "small business ai marketing agent for marketing teams",
+    "small business ai marketing agent for real estate",
+    "small business ai marketing agent for recruiters",
+    "small business ai marketing agent for hr teams",
+    "small business ai marketing agent for healthcare",
+    "small business ai marketing agent for finance teams",
+    "small business ai marketing agent for travel companies",
+    "small business ai marketing agent for developers",
+    "small business ai marketing agent for local businesses",
+    "small business ai marketing agent for startups 2026",
+    "small business ai marketing agent in 2026",
+    "small business ai marketing agent for remote teams",
+    "startup ai marketing agent for startups",
+    "startup ai marketing agent for small business",
+    "startup ai marketing agent for saas",
+    "startup ai marketing agent for agencies",
+    "startup ai marketing agent for ecommerce",
+    "startup ai marketing agent for sales teams",
+    "startup ai marketing agent for b2b",
+    "startup ai marketing agent for enterprises",
+    "startup ai marketing agent for customer support",
+    "startup ai marketing agent for marketing teams",
+    "startup ai marketing agent for real estate",
+    "startup ai marketing agent for recruiters",
+    "startup ai marketing agent for hr teams",
+    "startup ai marketing agent for healthcare",
+    "startup ai marketing agent for finance teams",
+    "startup ai marketing agent for travel companies",
+    "startup ai marketing agent for developers",
+    "startup ai marketing agent for local businesses",
+    "startup ai marketing agent for startups 2026",
+    "startup ai marketing agent in 2026",
+    "startup ai marketing agent for remote teams",
+    "alternative ai marketing agent for startups",
+    "alternative ai marketing agent for small business",
+    "alternative ai marketing agent for saas",
+    "alternative ai marketing agent for agencies",
+    "alternative ai marketing agent for ecommerce",
+    "alternative ai marketing agent for sales teams",
+    "alternative ai marketing agent for b2b",
+    "alternative ai marketing agent for enterprises",
+    "alternative ai marketing agent for customer support",
+    "alternative ai marketing agent for marketing teams",
+    "alternative ai marketing agent for real estate",
+    "alternative ai marketing agent for recruiters",
+    "alternative ai marketing agent for hr teams",
+    "alternative ai marketing agent for healthcare",
+    "alternative ai marketing agent for finance teams",
+    "alternative ai marketing agent for travel companies",
+    "alternative ai marketing agent for developers",
+    "alternative ai marketing agent for local businesses",
+    "alternative ai marketing agent for startups 2026",
+    "alternative ai marketing agent in 2026",
+    "alternative ai marketing agent for remote teams",
+    "alternatives ai marketing agent for startups",
+    "alternatives ai marketing agent for small business",
+    "alternatives ai marketing agent for saas",
+    "alternatives ai marketing agent for agencies",
+    "alternatives ai marketing agent for ecommerce",
+    "alternatives ai marketing agent for sales teams",
+    "alternatives ai marketing agent for b2b",
+    "alternatives ai marketing agent for enterprises",
+    "alternatives ai marketing agent for customer support",
+    "alternatives ai marketing agent for marketing teams",
+    "alternatives ai marketing agent for real estate",
+    "alternatives ai marketing agent for recruiters",
+    "alternatives ai marketing agent for hr teams",
+    "alternatives ai marketing agent for healthcare",
+    "alternatives ai marketing agent for finance teams",
+    "alternatives ai marketing agent for travel companies",
+    "alternatives ai marketing agent for developers",
+    "alternatives ai marketing agent for local businesses",
+    "alternatives ai marketing agent for startups 2026",
+    "alternatives ai marketing agent in 2026",
+    "alternatives ai marketing agent for remote teams",
+    "comparison ai marketing agent for startups",
+    "comparison ai marketing agent for small business",
+    "comparison ai marketing agent for saas",
+    "comparison ai marketing agent for agencies",
+    "comparison ai marketing agent for ecommerce",
+    "comparison ai marketing agent for sales teams",
+    "comparison ai marketing agent for b2b",
+    "comparison ai marketing agent for enterprises",
+    "comparison ai marketing agent for customer support",
+    "comparison ai marketing agent for marketing teams",
+    "comparison ai marketing agent for real estate",
+    "comparison ai marketing agent for recruiters",
+    "comparison ai marketing agent for hr teams",
+    "comparison ai marketing agent for healthcare",
+    "comparison ai marketing agent for finance teams",
+    "comparison ai marketing agent for travel companies",
+    "comparison ai marketing agent for developers",
+    "comparison ai marketing agent for local businesses",
+    "comparison ai marketing agent for startups 2026",
+    "comparison ai marketing agent in 2026",
+    "comparison ai marketing agent for remote teams",
+    "vs ai marketing agent for startups",
+    "vs ai marketing agent for small business",
+    "vs ai marketing agent for saas",
+    "vs ai marketing agent for agencies",
+    "vs ai marketing agent for ecommerce",
+    "vs ai marketing agent for sales teams",
+    "vs ai marketing agent for b2b",
+    "vs ai marketing agent for enterprises",
+    "vs ai marketing agent for customer support",
+    "vs ai marketing agent for marketing teams",
+    "vs ai marketing agent for real estate",
+    "vs ai marketing agent for recruiters",
+    "vs ai marketing agent for hr teams",
+    "vs ai marketing agent for healthcare",
+    "vs ai marketing agent for finance teams",
+    "vs ai marketing agent for travel companies",
+    "vs ai marketing agent for developers",
+    "vs ai marketing agent for local businesses",
+    "vs ai marketing agent for startups 2026",
+    "vs ai marketing agent in 2026",
+    "vs ai marketing agent for remote teams",
+    "pricing ai marketing agent for startups",
+    "pricing ai marketing agent for small business",
+    "pricing ai marketing agent for saas",
+    "pricing ai marketing agent for agencies",
+    "pricing ai marketing agent for ecommerce",
+    "pricing ai marketing agent for sales teams",
+    "pricing ai marketing agent for b2b",
+    "pricing ai marketing agent for enterprises",
+    "pricing ai marketing agent for customer support",
+    "pricing ai marketing agent for marketing teams",
+    "pricing ai marketing agent for real estate",
+    "pricing ai marketing agent for recruiters",
+    "pricing ai marketing agent for hr teams",
+    "pricing ai marketing agent for healthcare",
+    "pricing ai marketing agent for finance teams",
+    "pricing ai marketing agent for travel companies",
+    "pricing ai marketing agent for developers",
+    "pricing ai marketing agent for local businesses",
+    "pricing ai marketing agent for startups 2026",
+    "pricing ai marketing agent in 2026",
+    "pricing ai marketing agent for remote teams",
+    "review ai marketing agent for startups",
+    "review ai marketing agent for small business",
+    "review ai marketing agent for saas",
+    "review ai marketing agent for agencies",
+    "review ai marketing agent for ecommerce",
+    "review ai marketing agent for sales teams",
+    "review ai marketing agent for b2b",
+    "review ai marketing agent for enterprises",
+    "review ai marketing agent for customer support",
+    "review ai marketing agent for marketing teams",
+    "review ai marketing agent for real estate",
+    "review ai marketing agent for recruiters",
+    "review ai marketing agent for hr teams",
+    "review ai marketing agent for healthcare",
+    "review ai marketing agent for finance teams",
+    "review ai marketing agent for travel companies",
+    "review ai marketing agent for developers",
+    "review ai marketing agent for local businesses",
+    "review ai marketing agent for startups 2026",
+    "review ai marketing agent in 2026",
+    "review ai marketing agent for remote teams",
+    "software ai marketing agent for startups",
+    "software ai marketing agent for small business",
+    "software ai marketing agent for saas",
+    "software ai marketing agent for agencies",
+    "software ai marketing agent for ecommerce",
+    "software ai marketing agent for sales teams",
+    "software ai marketing agent for b2b",
+    "software ai marketing agent for enterprises",
+    "software ai marketing agent for customer support",
+    "software ai marketing agent for marketing teams",
+    "software ai marketing agent for real estate",
+    "software ai marketing agent for recruiters",
+    "software ai marketing agent for hr teams",
+    "software ai marketing agent for healthcare",
+    "software ai marketing agent for finance teams",
+    "software ai marketing agent for travel companies",
+    "software ai marketing agent for developers",
+    "software ai marketing agent for local businesses",
+    "software ai marketing agent for startups 2026",
+    "software ai marketing agent in 2026",
+    "software ai marketing agent for remote teams",
+    "platform ai marketing agent for startups",
+    "platform ai marketing agent for small business",
+    "platform ai marketing agent for saas",
+    "platform ai marketing agent for agencies",
+    "platform ai marketing agent for ecommerce",
+    "platform ai marketing agent for sales teams",
+    "platform ai marketing agent for b2b",
+    "platform ai marketing agent for enterprises",
+    "platform ai marketing agent for customer support",
+    "platform ai marketing agent for marketing teams",
+    "platform ai marketing agent for real estate",
+    "platform ai marketing agent for recruiters",
+    "platform ai marketing agent for hr teams",
+    "platform ai marketing agent for healthcare",
+    "platform ai marketing agent for finance teams",
+    "platform ai marketing agent for travel companies",
+    "platform ai marketing agent for developers",
+    "platform ai marketing agent for local businesses",
+    "platform ai marketing agent for startups 2026",
+    "platform ai marketing agent in 2026",
+    "platform ai marketing agent for remote teams",
+    "solution ai marketing agent for startups",
+    "solution ai marketing agent for small business",
+    "solution ai marketing agent for saas",
+    "solution ai marketing agent for agencies",
+    "solution ai marketing agent for ecommerce",
+    "solution ai marketing agent for sales teams",
+    "solution ai marketing agent for b2b",
+    "solution ai marketing agent for enterprises",
+    "solution ai marketing agent for customer support",
+    "solution ai marketing agent for marketing teams",
+    "solution ai marketing agent for real estate",
+    "solution ai marketing agent for recruiters",
+    "solution ai marketing agent for hr teams",
+    "solution ai marketing agent for healthcare",
+    "solution ai marketing agent for finance teams",
+    "solution ai marketing agent for travel companies",
+    "solution ai marketing agent for developers",
+    "solution ai marketing agent for local businesses",
+    "solution ai marketing agent for startups 2026",
+    "solution ai marketing agent in 2026",
+    "solution ai marketing agent for remote teams",
+    "tool ai marketing agent for startups",
+    "tool ai marketing agent for small business",
+    "tool ai marketing agent for saas",
+    "tool ai marketing agent for agencies",
+    "tool ai marketing agent for ecommerce",
+    "tool ai marketing agent for sales teams",
+    "tool ai marketing agent for b2b",
+    "tool ai marketing agent for enterprises",
+    "tool ai marketing agent for customer support",
+    "tool ai marketing agent for marketing teams",
+    "tool ai marketing agent for real estate",
+    "tool ai marketing agent for recruiters",
+    "tool ai marketing agent for hr teams",
+    "tool ai marketing agent for healthcare",
+    "tool ai marketing agent for finance teams",
+    "tool ai marketing agent for travel companies",
+    "tool ai marketing agent for developers",
+    "tool ai marketing agent for local businesses",
+    "tool ai marketing agent for startups 2026",
+    "tool ai marketing agent in 2026",
+    "tool ai marketing agent for remote teams",
+    "tools ai marketing agent for startups",
+    "tools ai marketing agent for small business",
+    "tools ai marketing agent for saas",
+    "tools ai marketing agent for agencies",
+    "tools ai marketing agent for ecommerce",
+    "tools ai marketing agent for sales teams",
+    "tools ai marketing agent for b2b",
+    "tools ai marketing agent for enterprises",
+    "tools ai marketing agent for customer support",
+    "tools ai marketing agent for marketing teams",
+    "tools ai marketing agent for real estate",
+    "tools ai marketing agent for recruiters",
+    "tools ai marketing agent for hr teams",
+    "tools ai marketing agent for healthcare",
+    "tools ai marketing agent for finance teams",
+    "tools ai marketing agent for travel companies",
+    "tools ai marketing agent for developers",
+    "tools ai marketing agent for local businesses",
+    "tools ai marketing agent for startups 2026",
+    "tools ai marketing agent in 2026",
+    "tools ai marketing agent for remote teams",
+    "provider ai marketing agent for startups",
+    "provider ai marketing agent for small business",
+    "provider ai marketing agent for saas",
+    "provider ai marketing agent for agencies",
+    "provider ai marketing agent for ecommerce",
+    "provider ai marketing agent for sales teams",
+    "provider ai marketing agent for b2b",
+    "provider ai marketing agent for enterprises",
+    "provider ai marketing agent for customer support",
+    "provider ai marketing agent for marketing teams",
+    "provider ai marketing agent for real estate",
+    "provider ai marketing agent for recruiters",
+    "provider ai marketing agent for hr teams",
+    "provider ai marketing agent for healthcare",
+    "provider ai marketing agent for finance teams",
+    "provider ai marketing agent for travel companies",
+    "provider ai marketing agent for developers",
+    "provider ai marketing agent for local businesses",
+    "provider ai marketing agent for startups 2026",
+    "provider ai marketing agent in 2026",
+    "provider ai marketing agent for remote teams",
+    "service ai marketing agent for startups",
+    "service ai marketing agent for small business",
+    "service ai marketing agent for saas",
+    "service ai marketing agent for agencies",
+    "service ai marketing agent for ecommerce",
+    "service ai marketing agent for sales teams",
+    "service ai marketing agent for b2b",
+    "service ai marketing agent for enterprises",
+    "service ai marketing agent for customer support",
+    "service ai marketing agent for marketing teams",
+    "service ai marketing agent for real estate",
+    "service ai marketing agent for recruiters",
+    "service ai marketing agent for hr teams",
+    "service ai marketing agent for healthcare",
+    "service ai marketing agent for finance teams",
+    "service ai marketing agent for travel companies",
+    "service ai marketing agent for developers",
+    "service ai marketing agent for local businesses",
+    "service ai marketing agent for startups 2026",
+    "service ai marketing agent in 2026",
+    "service ai marketing agent for remote teams",
+    "automation ai marketing agent for startups",
+    "automation ai marketing agent for small business",
+    "automation ai marketing agent for saas",
+    "automation ai marketing agent for agencies",
+    "automation ai marketing agent for ecommerce",
+    "automation ai marketing agent for sales teams",
+    "automation ai marketing agent for b2b",
+    "automation ai marketing agent for enterprises",
+    "automation ai marketing agent for customer support",
+    "automation ai marketing agent for marketing teams",
+    "automation ai marketing agent for real estate",
+    "automation ai marketing agent for recruiters",
+    "automation ai marketing agent for hr teams",
+    "automation ai marketing agent for healthcare",
+    "automation ai marketing agent for finance teams",
+    "automation ai marketing agent for travel companies",
+    "automation ai marketing agent for developers",
+    "automation ai marketing agent for local businesses",
+    "automation ai marketing agent for startups 2026",
+    "automation ai marketing agent in 2026",
+    "automation ai marketing agent for remote teams",
+    "best ai marketing agent",
+    "how to use ai marketing agent",
+    "how to choose ai marketing agent",
+    "looking for ai marketing agent",
+    "ai marketing agent recommendations",
+    "ai marketing agent alternatives",
+    "ai marketing agent comparison",
+    "ai marketing agent pricing",
+    "ai marketing agent review",
+    "ai marketing agent for lead generation",
+    "ai marketing agent for customer support",
+    "ai marketing agent for sales",
+    "ai marketing agent for marketing",
+    "ai marketing agent for business automation",
+    "ai marketing agent for appointment booking",
+    "ai marketing agent for outbound outreach",
+    "ai marketing agent for ecommerce",
+    "ai marketing agent for workflow automation",
+    "ai marketing agent for research",
+    "ai marketing agent for business",
+    "need ai marketing agent",
+    "recommend a ai marketing agent",
+    "what is the best ai marketing agent",
+    "which ai marketing agent should i use",
+    "best ai lead generation agent for startups",
+    "best ai lead generation agent for small business",
+    "best ai lead generation agent for saas",
+    "best ai lead generation agent for agencies",
+    "best ai lead generation agent for ecommerce",
+    "best ai lead generation agent for sales teams",
+    "best ai lead generation agent for b2b",
+    "best ai lead generation agent for enterprises",
+    "best ai lead generation agent for customer support",
+    "best ai lead generation agent for marketing teams",
+    "best ai lead generation agent for real estate",
+    "best ai lead generation agent for recruiters",
+    "best ai lead generation agent for hr teams",
+    "best ai lead generation agent for healthcare",
+    "best ai lead generation agent for finance teams",
+    "best ai lead generation agent for travel companies",
+    "best ai lead generation agent for developers",
+    "best ai lead generation agent for local businesses",
+    "best ai lead generation agent for startups 2026",
+    "best ai lead generation agent in 2026",
+    "best ai lead generation agent for remote teams",
+    "top ai lead generation agent for startups",
+    "top ai lead generation agent for small business",
+    "top ai lead generation agent for saas",
+    "top ai lead generation agent for agencies",
+    "top ai lead generation agent for ecommerce",
+    "top ai lead generation agent for sales teams",
+    "top ai lead generation agent for b2b",
+    "top ai lead generation agent for enterprises",
+    "top ai lead generation agent for customer support",
+    "top ai lead generation agent for marketing teams",
+    "top ai lead generation agent for real estate",
+    "top ai lead generation agent for recruiters",
+    "top ai lead generation agent for hr teams",
+    "top ai lead generation agent for healthcare",
+    "top ai lead generation agent for finance teams",
+    "top ai lead generation agent for travel companies",
+    "top ai lead generation agent for developers",
+    "top ai lead generation agent for local businesses",
+    "top ai lead generation agent for startups 2026",
+    "top ai lead generation agent in 2026",
+    "top ai lead generation agent for remote teams",
+    "recommended ai lead generation agent for startups",
+    "recommended ai lead generation agent for small business",
+    "recommended ai lead generation agent for saas",
+    "recommended ai lead generation agent for agencies",
+    "recommended ai lead generation agent for ecommerce",
+    "recommended ai lead generation agent for sales teams",
+    "recommended ai lead generation agent for b2b",
+    "recommended ai lead generation agent for enterprises",
+    "recommended ai lead generation agent for customer support",
+    "recommended ai lead generation agent for marketing teams",
+    "recommended ai lead generation agent for real estate",
+    "recommended ai lead generation agent for recruiters",
+    "recommended ai lead generation agent for hr teams",
+    "recommended ai lead generation agent for healthcare",
+    "recommended ai lead generation agent for finance teams",
+    "recommended ai lead generation agent for travel companies",
+    "recommended ai lead generation agent for developers",
+    "recommended ai lead generation agent for local businesses",
+    "recommended ai lead generation agent for startups 2026",
+    "recommended ai lead generation agent in 2026",
+    "recommended ai lead generation agent for remote teams",
+    "affordable ai lead generation agent for startups",
+    "affordable ai lead generation agent for small business",
+    "affordable ai lead generation agent for saas",
+    "affordable ai lead generation agent for agencies",
+    "affordable ai lead generation agent for ecommerce",
+    "affordable ai lead generation agent for sales teams",
+    "affordable ai lead generation agent for b2b",
+    "affordable ai lead generation agent for enterprises",
+    "affordable ai lead generation agent for customer support",
+    "affordable ai lead generation agent for marketing teams",
+    "affordable ai lead generation agent for real estate",
+    "affordable ai lead generation agent for recruiters",
+    "affordable ai lead generation agent for hr teams",
+    "affordable ai lead generation agent for healthcare",
+    "affordable ai lead generation agent for finance teams",
+    "affordable ai lead generation agent for travel companies",
+    "affordable ai lead generation agent for developers",
+    "affordable ai lead generation agent for local businesses",
+    "affordable ai lead generation agent for startups 2026",
+    "affordable ai lead generation agent in 2026",
+    "affordable ai lead generation agent for remote teams",
+    "enterprise ai lead generation agent for startups",
+    "enterprise ai lead generation agent for small business",
+    "enterprise ai lead generation agent for saas",
+    "enterprise ai lead generation agent for agencies",
+    "enterprise ai lead generation agent for ecommerce",
+    "enterprise ai lead generation agent for sales teams",
+    "enterprise ai lead generation agent for b2b",
+    "enterprise ai lead generation agent for enterprises",
+    "enterprise ai lead generation agent for customer support",
+    "enterprise ai lead generation agent for marketing teams",
+    "enterprise ai lead generation agent for real estate",
+    "enterprise ai lead generation agent for recruiters",
+    "enterprise ai lead generation agent for hr teams",
+    "enterprise ai lead generation agent for healthcare",
+    "enterprise ai lead generation agent for finance teams",
+    "enterprise ai lead generation agent for travel companies",
+    "enterprise ai lead generation agent for developers",
+    "enterprise ai lead generation agent for local businesses",
+    "enterprise ai lead generation agent for startups 2026",
+    "enterprise ai lead generation agent in 2026",
+    "enterprise ai lead generation agent for remote teams",
+    "small business ai lead generation agent for startups",
+    "small business ai lead generation agent for small business",
+    "small business ai lead generation agent for saas",
+    "small business ai lead generation agent for agencies",
+    "small business ai lead generation agent for ecommerce",
+    "small business ai lead generation agent for sales teams",
+    "small business ai lead generation agent for b2b",
+    "small business ai lead generation agent for enterprises",
+    "small business ai lead generation agent for customer support",
+    "small business ai lead generation agent for marketing teams",
+    "small business ai lead generation agent for real estate",
+    "small business ai lead generation agent for recruiters",
+    "small business ai lead generation agent for hr teams",
+    "small business ai lead generation agent for healthcare",
+    "small business ai lead generation agent for finance teams",
+    "small business ai lead generation agent for travel companies",
+    "small business ai lead generation agent for developers",
+    "small business ai lead generation agent for local businesses",
+    "small business ai lead generation agent for startups 2026",
+    "small business ai lead generation agent in 2026",
+    "small business ai lead generation agent for remote teams",
+    "startup ai lead generation agent for startups",
+    "startup ai lead generation agent for small business",
+    "startup ai lead generation agent for saas",
+    "startup ai lead generation agent for agencies",
+    "startup ai lead generation agent for ecommerce",
+    "startup ai lead generation agent for sales teams",
+    "startup ai lead generation agent for b2b",
+    "startup ai lead generation agent for enterprises",
+    "startup ai lead generation agent for customer support",
+    "startup ai lead generation agent for marketing teams",
+    "startup ai lead generation agent for real estate",
+    "startup ai lead generation agent for recruiters",
+    "startup ai lead generation agent for hr teams",
+    "startup ai lead generation agent for healthcare",
+    "startup ai lead generation agent for finance teams",
+    "startup ai lead generation agent for travel companies",
+    "startup ai lead generation agent for developers",
+    "startup ai lead generation agent for local businesses",
+    "startup ai lead generation agent for startups 2026",
+    "startup ai lead generation agent in 2026",
+    "startup ai lead generation agent for remote teams",
+    "alternative ai lead generation agent for startups",
+    "alternative ai lead generation agent for small business",
+    "alternative ai lead generation agent for saas",
+    "alternative ai lead generation agent for agencies",
+    "alternative ai lead generation agent for ecommerce",
+    "alternative ai lead generation agent for sales teams",
+    "alternative ai lead generation agent for b2b",
+    "alternative ai lead generation agent for enterprises",
+    "alternative ai lead generation agent for customer support",
+    "alternative ai lead generation agent for marketing teams",
+    "alternative ai lead generation agent for real estate",
+    "alternative ai lead generation agent for recruiters",
+    "alternative ai lead generation agent for hr teams",
+    "alternative ai lead generation agent for healthcare",
+    "alternative ai lead generation agent for finance teams",
+    "alternative ai lead generation agent for travel companies",
+    "alternative ai lead generation agent for developers",
+    "alternative ai lead generation agent for local businesses",
+    "alternative ai lead generation agent for startups 2026",
+    "alternative ai lead generation agent in 2026",
+    "alternative ai lead generation agent for remote teams",
+    "alternatives ai lead generation agent for startups",
+    "alternatives ai lead generation agent for small business",
+    "alternatives ai lead generation agent for saas",
+    "alternatives ai lead generation agent for agencies",
+    "alternatives ai lead generation agent for ecommerce",
+    "alternatives ai lead generation agent for sales teams",
+    "alternatives ai lead generation agent for b2b",
+    "alternatives ai lead generation agent for enterprises",
+    "alternatives ai lead generation agent for customer support",
+    "alternatives ai lead generation agent for marketing teams",
+    "alternatives ai lead generation agent for real estate",
+    "alternatives ai lead generation agent for recruiters",
+    "alternatives ai lead generation agent for hr teams",
+    "alternatives ai lead generation agent for healthcare",
+    "alternatives ai lead generation agent for finance teams",
+    "alternatives ai lead generation agent for travel companies",
+    "alternatives ai lead generation agent for developers",
+    "alternatives ai lead generation agent for local businesses",
+    "alternatives ai lead generation agent for startups 2026",
+    "alternatives ai lead generation agent in 2026",
+    "alternatives ai lead generation agent for remote teams",
+    "comparison ai lead generation agent for startups",
+    "comparison ai lead generation agent for small business",
+    "comparison ai lead generation agent for saas",
+    "comparison ai lead generation agent for agencies",
+    "comparison ai lead generation agent for ecommerce",
+    "comparison ai lead generation agent for sales teams",
+    "comparison ai lead generation agent for b2b",
+    "comparison ai lead generation agent for enterprises",
+    "comparison ai lead generation agent for customer support",
+    "comparison ai lead generation agent for marketing teams",
+    "comparison ai lead generation agent for real estate",
+    "comparison ai lead generation agent for recruiters",
+    "comparison ai lead generation agent for hr teams",
+    "comparison ai lead generation agent for healthcare",
+    "comparison ai lead generation agent for finance teams",
+    "comparison ai lead generation agent for travel companies",
+    "comparison ai lead generation agent for developers",
+    "comparison ai lead generation agent for local businesses",
+    "comparison ai lead generation agent for startups 2026",
+    "comparison ai lead generation agent in 2026",
+    "comparison ai lead generation agent for remote teams"
+            
+            ],
+    },
+    "community_software": {
+        "label": "Community Software / Online Community Platform",
+        "keywords": [
+            
+             "a community software for our users for networking between members",
+    "a community platform with mobile app for my business with groups and channels",
+    "a simple community platform for our SaaS customers with organized discussions",
+    "looking for a branded community platform for a global community that helps build stronger member relationships",
+    "a community management platform for a brand community that is easy for members to use",
+    "best community platform for product users with events and community management",
+    "we are looking for a community platform for my business that helps build stronger member relationships",
+    "looking to switch to an affordable community platform for creators without using Discord",
+    "an affordable community platform for an event community without using Discord",
+    "an affordable community platform for an agency that is easy for members to use",
+    "a simple community platform for my business with private spaces",
+    "does anyone know a a customer community platform for our customers that is easy for members to use",
+    "best community platform for my business with member profiles",
+    "we are looking for a community platform for my startup that works on web and mobile",
+    "any recommendations for an affordable community platform for a nonprofit for meaningful discussions",
+    "a place to host my community for a creator community that supports paid memberships",
+    "best community platform for an e-commerce brand that has good moderation tools",
+    "we are looking for a community platform for creators that supports paid memberships",
+    "recommendations for a community platform for product users",
+    "we are looking for a community platform for a creator community without using Discord",
+    "a community solution for an online course without relying on Facebook",
+    "we are looking for a community platform for founders that is easy for members to use",
+    "best community platform for a coaching business with real-time chat",
+    "a community platform for conversations for product users that gives us ownership of our community",
+    "a modern community app for product users that works on web and mobile",
+    "we are looking for a community platform for a gaming community that has good moderation tools",
+    "need help finding a branded community platform for a gaming community with events and community management",
+    "searching for a community platform with chat for an e-commerce brand with a clean user experience",
+    "best community platform for our users without using Discord",
+    "we are looking for a community platform for remote teams and members with organized discussions",
+    "best community platform for a nonprofit for meaningful discussions",
+    "a simple community platform for a paid membership with better engagement",
+    "best community platform for my company that has good moderation tools",
+    "want a community solution for an online course where conversations do not get lost",
+    "best community platform for our customers for customer engagement",
+    "a platform for building an online community for a membership business with events and community management",
+    "we are looking for a community platform for a professional network for networking between members",
+    "we are looking for a community platform for alumni without relying on Facebook",
+    "looking to switch to a platform for a paid community for an e-commerce brand for meaningful discussions",
+    "best community platform for a gaming community that has good moderation tools",
+    "best community platform for creators without relying on Facebook",
+    "we are looking for a community platform for a professional network with better engagement",
+    "what is the best an online community platform for a membership business with events and community management",
+    "we are looking for a community platform for an online course with events and community management",
+    "we are looking for a community platform for remote teams and members that helps build stronger member relationships",
+    "a platform for a paid community for a paid membership where conversations do not get lost",
+    "best community platform for a nonprofit that helps build stronger member relationships",
+    "what is the best a branded community platform for a local community with a clean user experience",
+    "trying to find a better alternative to Discord for a paid membership for meaningful discussions",
+    "does anyone know a a better alternative to Slack communities for a paid membership with a clean user experience",
+    "best community platform for our customers that can scale with our community",
+    "a simple community platform for a coaching business with member profiles",
+    "a better alternative to Discord for a paid membership that supports onboarding new members",
+    "best community platform for my startup that gives us ownership of our community",
+    "we are looking for a community platform for my business with member profiles",
+    "any recommendations for a branded community platform for creators with member profiles",
+    "we are looking for a community platform for an agency with private spaces",
+    "a private community platform for remote teams and members with private spaces",
+    "a platform for a free community for entrepreneurs that is easy to set up",
+    "what is the best a community platform for my audience for entrepreneurs that gives us ownership of our community",
+    "best community platform for our users that is easy to set up",
+    "a better alternative to Slack communities for a B2B community that is easy to set up",
+    "we are looking for a community platform for my business where conversations do not get lost",
+    "a community platform with chat for our SaaS customers with private spaces",
+    "best community platform for an online course with member profiles",
+    "we are looking for a community platform for a local community with a clean user experience",
+    "best community platform for developers that gives us ownership of our community",
+    "best community platform for a coaching business that has good moderation tools",
+    "need a modern community app for a professional network that helps build stronger member relationships",
+    "a place to host my community for an e-commerce brand with groups and channels",
+    "a white label community platform for developers that does not feel like a social media feed",
+    "best community platform for a nonprofit without relying on Facebook",
+    "a platform for a paid community for an AI community without relying on Facebook",
+    "a community platform with mobile app for a local community with organized discussions",
+    "a place to host my community for product users with a clean user experience",
+    "an online community platform for an event community that has good moderation tools",
+    "a better alternative to Discord for a coaching business that works on web and mobile",
+    "want a community platform for my audience for a B2B community that helps build stronger member relationships",
+    "a better alternative to Slack communities for a professional network with better engagement",
+    "best community platform for a nonprofit with private spaces",
+    "we are looking for a community platform for an online course with groups and channels",
+    "searching for a platform for building an online community for a professional network with better engagement",
+    "can anyone suggest a a community platform with mobile app for my company with a clean user experience",
+    "best community platform for investors and founders for customer engagement",
+    "a community platform with chat for creators that helps build stronger member relationships",
+    "does anyone know a a better alternative to Facebook Groups for an online course with member profiles",
+    "a community platform with mobile app for our users that is easy to set up",
+    "a better alternative to Facebook Groups for my startup without using Discord",
+    "what is the best a modern community app for founders with real-time chat",
+    "any recommendations for a community platform for conversations for developers that works on web and mobile",
+    "best community platform for investors and founders that supports onboarding new members",
+    "need a customer community platform for our customers that keeps members active",
+    "a platform for a free community for a local community that is more focused than Slack",
+    "a platform to connect members for a local community for meaningful discussions",
+    "trying to find a platform to create a niche community for creators that has good moderation tools",
+    "we are looking for a community platform for creators with member profiles",
+    "an online community platform for a creator community with events and community management",
+    "recommendations for a community platform for my startup",
+    "a community solution for a local community without using Discord",
+    "we are looking for a community platform for our SaaS customers that is easy to set up",
+    "need help finding a community platform for my audience for a global community with groups and channels",
+    "best community platform for investors and founders that works on web and mobile",
+    "best community platform for a coaching business without using Discord",
+    "we are looking for a community platform for a B2B community with events and community management",
+    "searching for a community software for a local community that supports onboarding new members",
+    "a better alternative to Slack communities for product users without relying on Facebook",
+    "a community platform with AI for my startup with better community analytics",
+    "best community platform for an AI community without using Discord",
+    "a platform for a paid community for creators that has good moderation tools",
+    "a platform to connect members for a membership business with better community analytics",
+    "recommend a a community platform for my audience for creators that gives us ownership of our community",
+    "a community platform with AI for alumni that supports paid memberships",
+    "trying to find a community software for a nonprofit without relying on Facebook",
+    "we are looking for a community platform for my startup with better engagement",
+    "a private community platform for a nonprofit that does not feel like a social media feed",
+    "best community platform for a coaching business that does not feel like a social media feed",
+    "a community platform for an agency without using Discord",
+    "best community platform for creators that supports paid memberships",
+    "a community platform for conversations for founders with a clean user experience",
+    "a branded community platform for my company that is easy for members to use",
+    "a community platform for a professional network that helps build stronger member relationships",
+    "we are looking for a community platform for a professional network with groups and channels",
+    "we are looking for a community platform for a nonprofit without using Discord",
+    "a platform to create a niche community for students with better engagement",
+    "searching for a simple community platform for our users where conversations do not get lost",
+    "a community platform for my audience for a paid membership with better engagement",
+    "a place to host my community for my startup with events and community management",
+    "we are looking for a community platform for students that is more focused than Slack",
+    "we are looking for a community platform for a B2B community with a clean user experience",
+    "we are looking for a community platform for a membership business that keeps members active",
+    "looking for a community management platform for remote teams and members with events and community management",
+    "searching for a community platform with mobile app for a nonprofit with better engagement",
+    "a place to host my community for entrepreneurs that can scale with our community",
+    "thinking about building a community for a coaching business",
+    "a branded community platform for our customers with member profiles",
+    "we are looking for a community platform for a gaming community that supports onboarding new members",
+    "does anyone know a a better alternative to Slack communities for entrepreneurs that keeps members active",
+    "we are looking for a community platform for an AI community that has good moderation tools",
+    "best community platform for a professional network that keeps members active",
+    "best community platform for an AI community without relying on Facebook",
+    "want a branded community platform for a gaming community that is more focused than Slack",
+    "looking to switch to a platform to create a niche community for an agency that is easy to set up",
+    "best community platform for developers that supports onboarding new members",
+    "best community platform for developers without using Discord",
+    "a place to host my community for a membership business that is more focused than Slack",
+    "we are looking for a community platform for a creator community for customer engagement",
+    "we are looking for a community platform for creators with private spaces",
+    "a customer community platform for alumni without relying on Facebook",
+    "a community platform with chat for founders with organized discussions",
+    "a community platform with mobile app for remote teams and members for customer engagement",
+    "best community platform for my business that keeps members active",
+    "a community platform with AI for alumni that is more focused than Slack",
+    "we are looking for a community platform for product users that is easy for members to use",
+    "a branded community platform for a coaching business with real-time chat",
+    "need a simple community platform for a gaming community with better community analytics",
+    "anyone using a community platform for remote teams and members",
+    "need help finding a platform to create a niche community for entrepreneurs with real-time chat",
+    "a community platform for a creator community that is easy for members to use",
+    "a community software for a coaching business with member profiles",
+    "best community platform for entrepreneurs for customer engagement",
+    "a community management platform for my business without using Discord",
+    "a community software for a membership business that has good moderation tools",
+    "we are looking for a community platform for a creator community that is more focused than Slack",
+    "any recommendations for a white label community platform for a coaching business that supports onboarding new members",
+    "a platform to connect members for creators with a clean user experience",
+    "a platform for a free community for an event community with organized discussions",
+    "we are looking for a community platform for a paid membership with a clean user experience",
+    "searching for a better alternative to Slack communities for an agency where conversations do not get lost",
+    "a community platform for conversations for a brand community for meaningful discussions",
+    "can anyone suggest a a community platform for students that does not feel like a social media feed",
+    "we are looking for a community platform for an online course that is more focused than Slack",
+    "best community platform for my startup with better community analytics",
+    "can anyone suggest a a platform to connect members for a nonprofit that gives us ownership of our community",
+    "trying to find a community platform with mobile app for entrepreneurs that does not feel like a social media feed",
+    "a place to host my community for a local community with events and community management",
+    "looking to switch to a simple community platform for a brand community that supports onboarding new members",
+    "can anyone suggest a a community platform with mobile app for an online course that keeps members active",
+    "need help finding a community solution for my startup with better community analytics",
+    "thinking about building a community for a paid membership",
+    "best community platform for founders with events and community management",
+    "a place to host my community for an online course without relying on Facebook",
+    "a community platform with mobile app for a brand community with a clean user experience",
+    "best community platform for a brand community that supports paid memberships",
+    "we are looking for a community platform for a membership business with a clean user experience",
+    "a platform where members can talk and connect for students that supports paid memberships",
+    "a modern community app for students with better community analytics",
+    "a better alternative to Slack communities for an e-commerce brand that does not feel like a social media feed",
+    "does anyone know a a community software for founders that is easy for members to use",
+    "how do I build an online community for our SaaS customers",
+    "a modern community app for creators that is easy to set up",
+    "we are looking for a community platform for remote teams and members for networking between members",
+    "we are looking for a community platform for an AI community that can scale with our community",
+    "looking to switch to a community platform with AI for a professional network that supports onboarding new members",
+    "a community platform for conversations for an e-commerce brand without using Discord",
+    "a platform for a free community for a coaching business with a clean user experience",
+    "we are looking for a community platform for a gaming community that gives us ownership of our community",
+    "we are looking for a community platform for remote teams and members that works on web and mobile",
+    "recommend a a community platform for my audience for a creator community that gives us ownership of our community",
+    "a platform for a free community for a coaching business for meaningful discussions",
+    "need help finding a better alternative to Discord for an event community that does not feel like a social media feed",
+    "we are looking for a community platform for a nonprofit with better community analytics",
+    "we are looking for a community platform for investors and founders where conversations do not get lost",
+    "a modern community app for a gaming community that can scale with our community",
+    "recommendations for a community platform for students",
+    "we are looking for a community platform for investors and founders with private spaces",
+    "we are looking for a community platform for an e-commerce brand that does not feel like a social media feed",
+    "we are looking for a community platform for a membership business that supports onboarding new members",
+    "a better alternative to Discord for a creator community without using Discord",
+    "need a private community platform for our users that gives us ownership of our community",
+    "an online community platform for our users where conversations do not get lost",
+    "best community platform for an e-commerce brand with organized discussions",
+    "need help finding a better alternative to Slack communities for a membership business that is easy to set up",
+    "looking for a simple community platform for an online course that can scale with our community",
+    "a platform for a paid community for our SaaS customers for networking between members",
+    "a modern community app for an online course that does not feel like a social media feed",
+    "we are looking for a community platform for entrepreneurs without using Discord",
+    "a platform where members can talk and connect for a local community that is more focused than Slack",
+    "best community platform for our users without relying on Facebook",
+    "considering a platform where members can talk and connect for a brand community that gives us ownership of our community",
+    "a community software for product users that supports onboarding new members",
+    "we are looking for a community platform for a coaching business that can scale with our community",
+    "we are looking for a community platform for a coaching business that is easy for members to use",
+    "how do I build an online community for entrepreneurs",
+    "trying to find a better alternative to Slack communities for creators with events and community management",
+    "we are looking for a community platform for an e-commerce brand where conversations do not get lost",
+    "we are looking for a community platform for our customers that helps build stronger member relationships",
+    "a community platform with AI for a nonprofit that keeps members active",
+    "a private community platform for alumni that is more focused than Slack",
+    "an online community platform for founders with events and community management",
+    "a community platform for my audience for a paid membership with better community analytics",
+    "best community platform for an AI community with member profiles",
+    "a community software for an AI community that works on web and mobile",
+    "we are looking for a community platform for a professional network that gives us ownership of our community",
+    "best community platform for an online course with a clean user experience",
+    "a simple community platform for developers that is more focused than Slack",
+    "where can I find a a community management platform for a coaching business with organized discussions",
+    "any recommendations for a simple community platform for an online course without using Discord",
+    "best community platform for product users with better community analytics",
+    "best community platform for a global community that is easy to set up",
+    "looking to switch to a modern community app for my business that gives us ownership of our community",
+    "a place to host my community for a paid membership with better engagement",
+    "we are looking for a community platform for my startup that supports paid memberships",
+    "best community platform for a nonprofit that keeps members active",
+    "a platform for a free community for a local community that is easy for members to use",
+    "we are looking for a community platform for an e-commerce brand for meaningful discussions",
+    "thinking about building a community for an event community",
+    "best community platform for students with groups and channels",
+    "a platform to connect members for product users that can scale with our community",
+    "looking for a community platform for my audience for my startup that is easy for members to use",
+    "does anyone know a a better alternative to Discord for investors and founders that gives us ownership of our community",
+    "want a modern community app for my business for customer engagement",
+    "we are looking for a community platform for alumni with better community analytics",
+    "how do I build an online community for investors and founders",
+    "we are looking for a community platform for my company that works on web and mobile",
+    "anyone using a community platform for a global community",
+    "what is the best a platform where members can talk and connect for a coaching business with groups and channels",
+    "want a white label community platform for my company that helps build stronger member relationships",
+    "where can I find a a community platform for my audience for our users that is easy for members to use",
+    "we are looking for a community platform for entrepreneurs that does not feel like a social media feed",
+    "recommendations for a community platform for investors and founders",
+    "what is the best a private community platform for students that supports onboarding new members",
+    "best community platform for an AI community that is more focused than Slack",
+    "anyone using a community platform for creators",
+    "a platform to connect members for a paid membership that helps build stronger member relationships",
+    "we are looking for a community platform for a nonprofit with groups and channels",
+    "looking for a modern community app for my company with private spaces",
+    "we are looking for a community platform for a professional network with private spaces",
+    "we are looking for a community platform for a paid membership for meaningful discussions",
+    "we are looking for a community platform for an e-commerce brand that is easy to set up",
+    "we are looking for a community platform for a B2B community with member profiles",
+    "trying to find a platform where members can talk and connect for an online course with better community analytics",
+    "considering a community platform for my audience for a nonprofit that helps build stronger member relationships",
+    "we are looking for a community platform for a coaching business that is easy to set up",
+    "a modern community app for my business that is more focused than Slack",
+    "a better alternative to Facebook Groups for an agency with events and community management",
+    "looking to switch to a community platform for my business with real-time chat",
+    "best community platform for an event community where conversations do not get lost",
+    "best community platform for my startup that supports onboarding new members",
+    "best community platform for a B2B community for customer engagement",
+    "best community platform for our SaaS customers that is easy to set up",
+    "searching for a community platform for my audience for an AI community with private spaces",
+    "a community platform with AI for a local community that supports paid memberships",
+    "best community platform for our customers that supports paid memberships",
+    "best community platform for an event community for networking between members",
+    "a platform for a paid community for an e-commerce brand with private spaces",
+    "a community platform with AI for an e-commerce brand that does not feel like a social media feed",
+    "searching for a community solution for an e-commerce brand with member profiles",
+    "what is the best a community platform with chat for product users with better community analytics",
+    "best community platform for a creator community with better community analytics",
+    "where can I find a a modern community app for alumni with better engagement",
+    "need help finding a community platform for conversations for a coaching business where conversations do not get lost",
+    "want a platform for a free community for remote teams and members with better community analytics",
+    "we are looking for a community platform for remote teams and members for customer engagement",
+    "thinking about building a community for my business",
+    "a platform for a free community for creators where conversations do not get lost",
+    "best community platform for a brand community that does not feel like a social media feed",
+    "a platform to connect members for a gaming community that keeps members active",
+    "looking for a place to host my community for a global community that supports paid memberships",
+    "best community platform for our customers with events and community management",
+    "where can I find a a platform for a free community for an agency that keeps members active",
+    "can anyone suggest a a community platform for my audience for product users that is easy to set up",
+    "best community platform for a professional network that works on web and mobile",
+    "a community solution for an event community without relying on Facebook",
+    "searching for a platform where members can talk and connect for creators with real-time chat",
+    "a platform to create a niche community for product users with better engagement",
+    "a community platform for my audience for my business that does not feel like a social media feed",
+    "best community platform for remote teams and members with events and community management",
+    "looking to switch to a platform for a paid community for a coaching business for networking between members",
+    "does anyone know a a community platform with AI for developers for networking between members",
+    "trying to find a better alternative to Slack communities for an AI community that is easy to set up",
+    "does anyone know a a platform for a paid community for investors and founders for meaningful discussions",
+    "best community platform for an agency with a clean user experience",
+    "considering a customer community platform for our customers that works on web and mobile",
+    "best community platform for a global community that is easy for members to use",
+    "searching for a white label community platform for a membership business that supports paid memberships",
+    "a community platform for conversations for students with a clean user experience",
+    "what is the best a community platform with AI for founders with private spaces",
+    "want a platform for a paid community for an AI community that can scale with our community",
+    "a customer community platform for my company that supports paid memberships",
+    "best community platform for my startup that supports paid memberships",
+    "an online community platform for my business that is easy for members to use",
+    "a branded community platform for investors and founders with better engagement",
+    "considering a community platform for my audience for my company that does not feel like a social media feed",
+    "a better alternative to Facebook Groups for creators where conversations do not get lost",
+    "a platform to create a niche community for an AI community that supports onboarding new members",
+    "we are looking for a community platform for a paid membership with organized discussions",
+    "best community platform for product users that has good moderation tools",
+    "where can I find a a community platform with AI for developers for networking between members",
+    "we are looking for a community platform for developers with groups and channels",
+    "best community platform for remote teams and members that does not feel like a social media feed",
+    "where can I find a a better alternative to Facebook Groups for a creator community that has good moderation tools",
+    "trying to find a platform to connect members for founders for meaningful discussions",
+    "best community platform for creators that is easy for members to use",
+    "best community platform for an e-commerce brand for networking between members",
+    "a private community platform for a gaming community with real-time chat",
+    "trying to find a better alternative to Slack communities for an AI community for meaningful discussions",
+    "a better alternative to Discord for students with real-time chat",
+    "a platform to create a niche community for product users that supports onboarding new members",
+    "best community platform for our SaaS customers for networking between members",
+    "a modern community app for an online course that can scale with our community",
+    "we are looking for a community platform for founders that supports paid memberships",
+    "we are looking for a community platform for students that supports onboarding new members",
+    "best community platform for a paid membership for networking between members",
+    "looking for a community management platform for my company with better community analytics",
+    "a community platform for my audience for entrepreneurs with groups and channels",
+    "recommendations for a community platform for a global community",
+    "we are looking for a community platform for an agency that is easy for members to use",
+    "does anyone know a a platform to connect members for my startup that is easy for members to use",
+    "can anyone suggest a a white label community platform for a local community that gives us ownership of our community",
+    "best community platform for a nonprofit that does not feel like a social media feed",
+    "a community platform with chat for a paid membership that is easy to set up",
+    "best community platform for developers that has good moderation tools",
+    "best community platform for students that does not feel like a social media feed",
+    "want a platform where members can talk and connect for product users where conversations do not get lost",
+    "where can I find a a customer community platform for a creator community without using Discord",
+    "we are looking for a community platform for our customers with private spaces",
+    "a community platform with chat for remote teams and members that gives us ownership of our community",
+    "best community platform for entrepreneurs with better engagement",
+    "a community management platform for my company that gives us ownership of our community",
+    "best community platform for a professional network that helps build stronger member relationships",
+    "want a community platform for a membership business for customer engagement",
+    "a place to host my community for a gaming community where conversations do not get lost",
+    "best community platform for a brand community that keeps members active",
+    "a place to host my community for a professional network that gives us ownership of our community",
+    "we are looking for a community platform for product users with groups and channels",
+    "recommend a a white label community platform for a paid membership with private spaces",
+    "we are looking for a community platform for an online course that does not feel like a social media feed",
+    "a customer community platform for founders that has good moderation tools",
+    "searching for a community platform for my audience for product users without using Discord",
+    "we are looking for a community platform for my company with real-time chat",
+    "a community management platform for our customers that is more focused than Slack",
+    "where can I find a a modern community app for a global community that supports onboarding new members",
+    "we are looking for a community platform for an AI community with organized discussions",
+    "best community platform for a B2B community that has good moderation tools",
+    "best community platform for founders for customer engagement",
+    "best community platform for a paid membership with better engagement",
+    "a platform for a free community for our users for customer engagement",
+    "a place to host my community for an e-commerce brand with events and community management",
+    "a platform to connect members for a gaming community with member profiles",
+    "best community platform for investors and founders that is easy to set up",
+    "a platform to connect members for my company that can scale with our community",
+    "need help finding a better alternative to Discord for our users for customer engagement",
+    "we are looking for a community platform for my business that gives us ownership of our community",
+    "best community platform for my startup without relying on Facebook",
+    "best community platform for an event community that is easy to set up",
+    "best community platform for creators that can scale with our community",
+    "recommendations for a community platform for an AI community",
+    "best community platform for remote teams and members that supports onboarding new members",
+    "we are looking for a community platform for an online course with member profiles",
+    "how do I build an online community for a coaching business",
+    "recommend a a community platform with AI for our SaaS customers where conversations do not get lost",
+    "looking to switch to a platform to create a niche community for an agency for customer engagement",
+    "a platform for building an online community for a paid membership that keeps members active",
+    "a community platform for my audience for alumni without relying on Facebook",
+    "best community platform for remote teams and members where conversations do not get lost",
+    "best community platform for a gaming community that supports paid memberships",
+    "looking to switch to a branded community platform for our users where conversations do not get lost",
+    "we are looking for a community platform for investors and founders with events and community management",
+    "can anyone suggest a a community platform for our SaaS customers with groups and channels",
+    "a community platform for my audience for students that is more focused than Slack",
+    "a platform for a free community for a creator community that is more focused than Slack",
+    "a simple community platform for a nonprofit without relying on Facebook",
+    "we are looking for a community platform for a brand community with better engagement",
+    "considering an online community platform for creators without relying on Facebook",
+    "we are looking for a community platform for a global community for networking between members",
+    "recommend a an affordable community platform for our SaaS customers with real-time chat",
+    "best community platform for investors and founders that has good moderation tools",
+    "a community platform for conversations for my business that has good moderation tools",
+    "any recommendations for a community platform for a nonprofit without using Discord",
+    "we are looking for a community platform for an AI community that supports onboarding new members",
+    "a community solution for developers with real-time chat",
+    "an affordable community platform for an agency with real-time chat",
+    "we are looking for a community platform for a gaming community that supports paid memberships",
+    "we are looking for a community platform for an AI community with real-time chat",
+    "we are looking for a community platform for a professional network that helps build stronger member relationships",
+    "a branded community platform for our customers that supports onboarding new members",
+    "a better alternative to Slack communities for remote teams and members with private spaces",
+    "we are looking for a community platform for a local community that works on web and mobile",
+    "best community platform for an online course that supports paid memberships",
+    "a simple community platform for alumni with groups and channels",
+    "trying to find a simple community platform for product users that does not feel like a social media feed",
+    "need a white label community platform for investors and founders that does not feel like a social media feed",
+    "a branded community platform for our users with groups and channels",
+    "best community platform for our customers for meaningful discussions",
+    "a community platform for my audience for a brand community for meaningful discussions",
+    "a branded community platform for product users for meaningful discussions",
+    "a branded community platform for a creator community that is more focused than Slack",
+    "a community software for students for meaningful discussions",
+    "an online community platform for our customers with better community analytics",
+    "we are looking for a community platform for remote teams and members that does not feel like a social media feed",
+    "best community platform for an e-commerce brand that keeps members active",
+    "what is the best a community solution for my business with better engagement",
+    "a community platform with chat for an AI community with organized discussions",
+    "recommend a a platform where members can talk and connect for creators that supports paid memberships",
+    "best community platform for creators with member profiles",
+    "we are looking for a community platform for founders with real-time chat",
+    "need an online community platform for a professional network that helps build stronger member relationships",
+    "a better alternative to Facebook Groups for a professional network that helps build stronger member relationships",
+    "an online community platform for developers with private spaces",
+    "best community platform for entrepreneurs where conversations do not get lost",
+    "considering a community platform for an AI community with better community analytics",
+    "a white label community platform for a coaching business with events and community management",
+    "a platform for a free community for a nonprofit with groups and channels",
+    "does anyone know a a branded community platform for investors and founders with a clean user experience",
+    "we are looking for a community platform for a gaming community that can scale with our community",
+    "a platform to create a niche community for an event community where conversations do not get lost",
+    "can anyone suggest a a community platform for a nonprofit with private spaces",
+    "we are looking for a community platform for a global community with a clean user experience",
+    "we are looking for a community platform for a coaching business that has good moderation tools",
+    "need help finding an affordable community platform for students that works on web and mobile",
+    "want a community platform for my audience for a professional network that does not feel like a social media feed",
+    "a community platform for conversations for a paid membership that can scale with our community",
+    "we are looking for a community platform for a gaming community with a clean user experience",
+    "best community platform for a creator community that supports onboarding new members",
+    "we are looking for a community platform for my startup with private spaces",
+    "can anyone suggest a a customer community platform for a global community that gives us ownership of our community",
+    "we are looking for a community platform for a global community without using Discord",
+    "we are looking for a community platform for founders with private spaces",
+    "what is the best a community solution for product users where conversations do not get lost",
+    "where can I find a a platform for a free community for a nonprofit that gives us ownership of our community",
+    "a place to host my community for a B2B community that is easy for members to use",
+    "we are looking for a community platform for an agency that has good moderation tools",
+    "any recommendations for a simple community platform for our customers with real-time chat",
+    "we are looking for a community platform for my company with better engagement",
+    "looking to switch to a community platform with chat for investors and founders that is more focused than Slack",
+    "an affordable community platform for an online course with groups and channels",
+    "best community platform for developers that is easy to set up",
+    "how do I build an online community for a global community",
+    "thinking about building a community for alumni",
+    "a branded community platform for a global community that supports onboarding new members",
+    "looking for a private community platform for alumni with events and community management",
+    "best community platform for my company that supports paid memberships",
+    "what is the best a platform for a free community for a gaming community that supports paid memberships",
+    "a community management platform for product users that can scale with our community",
+    "best community platform for a coaching business with private spaces",
+    "considering a community solution for my company that keeps members active",
+    "can anyone suggest a a community platform for conversations for entrepreneurs that is easy to set up",
+    "a platform to connect members for my company for customer engagement",
+    "best community platform for developers with events and community management",
+    "a better alternative to Facebook Groups for an AI community with a clean user experience",
+    "a platform for a free community for a B2B community that supports onboarding new members",
+    "best community platform for a creator community that is more focused than Slack",
+    "recommend a a customer community platform for our SaaS customers for networking between members",
+    "a community platform with mobile app for alumni for customer engagement",
+    "a better alternative to Slack communities for an e-commerce brand where conversations do not get lost",
+    "considering a customer community platform for my business without using Discord",
+    "a community solution for an agency that gives us ownership of our community",
+    "searching for a place to host my community for remote teams and members for meaningful discussions",
+    "best community platform for product users with real-time chat",
+    "a simple community platform for alumni without relying on Facebook",
+    "we are looking for a community platform for a paid membership with member profiles",
+    "best community platform for an AI community with organized discussions",
+    "we are looking for a community platform for investors and founders that keeps members active",
+    "we are looking for a community platform for a global community that gives us ownership of our community",
+    "a simple community platform for an agency with a clean user experience",
+    "we are looking for a community platform for developers that does not feel like a social media feed",
+    "can anyone suggest a a community platform with mobile app for a membership business that has good moderation tools",
+    "need a modern community app for a global community with private spaces",
+    "a community platform for founders that keeps members active",
+    "best community platform for a B2B community for networking between members",
+    "a branded community platform for product users that helps build stronger member relationships",
+    "how do I build an online community for a local community",
+    "best community platform for an event community with a clean user experience",
+    "best community platform for our SaaS customers for meaningful discussions",
+    "looking for a community solution for alumni with a clean user experience",
+    "a community platform with AI for alumni for networking between members",
+    "we are looking for a community platform for my company for meaningful discussions",
+    "what is the best a white label community platform for a coaching business with real-time chat",
+    "best community platform for students that gives us ownership of our community",
+    "best community platform for a global community where conversations do not get lost",
+    "we are looking for a community platform for our SaaS customers that works on web and mobile",
+    "best community platform for a gaming community with private spaces",
+    "best community platform for product users with organized discussions",
+    "trying to find an affordable community platform for product users that works on web and mobile",
+    "a simple community platform for a membership business where conversations do not get lost",
+    "an online community platform for my company with better community analytics",
+    "recommend a a community platform for my audience for a global community that is easy to set up",
+    "we are looking for a community platform for our customers with real-time chat",
+    "recommend a a community platform for conversations for investors and founders for meaningful discussions",
+    "a better alternative to Facebook Groups for a creator community with better engagement",
+    "looking to switch to a better alternative to Discord for investors and founders that helps build stronger member relationships",
+    "best community platform for our SaaS customers with a clean user experience",
+    "what is the best a simple community platform for my startup with private spaces",
+    "a community software for an online course for customer engagement",
+    "searching for a platform for a paid community for a nonprofit with better community analytics",
+    "any recommendations for a community platform for conversations for a local community that has good moderation tools",
+    "best community platform for our customers that is easy to set up",
+    "best community platform for developers that is more focused than Slack",
+    "a platform where members can talk and connect for creators that works on web and mobile",
+    "a community platform for conversations for my company where conversations do not get lost",
+    "a modern community app for developers that is easy to set up",
+    "trying to find a community platform with AI for founders without relying on Facebook",
+    "any recommendations for a platform to connect members for our customers with real-time chat",
+    "can anyone suggest a a community platform with AI for entrepreneurs that supports paid memberships",
+    "recommend a an affordable community platform for investors and founders without relying on Facebook",
+    "looking for a private community platform for developers with organized discussions",
+    "we are looking for a community platform for my company that is easy for members to use",
+    "best community platform for entrepreneurs that can scale with our community",
+    "best community platform for an agency without relying on Facebook",
+    "we are looking for a community platform for an online course with better community analytics",
+    "recommendations for a community platform for my company",
+    "best community platform for my business that is easy to set up",
+    "best community platform for a paid membership where conversations do not get lost",
+    "any recommendations for a better alternative to Slack communities for a creator community with groups and channels",
+    "a branded community platform for students that helps build stronger member relationships",
+    "we are looking for a community platform for students that works on web and mobile",
+    "where can I find a a community management platform for a nonprofit that keeps members active",
+    "best community platform for an e-commerce brand that works on web and mobile",
+    "a better alternative to Slack communities for founders that has good moderation tools",
+    "recommend a a customer community platform for remote teams and members that has good moderation tools",
+    "we are looking for a community platform for an agency with member profiles",
+    "a place to host my community for a membership business with better community analytics",
+    "best community platform for a coaching business that can scale with our community",
+    "we are looking for a community platform for our SaaS customers that does not feel like a social media feed",
+    "we are looking for a community platform for our customers that is more focused than Slack",
+    "a community platform with chat for a gaming community that can scale with our community",
+    "an affordable community platform for founders for networking between members",
+    "best community platform for a coaching business that gives us ownership of our community",
+    "we are looking for a community platform for my company with better community analytics",
+    "a white label community platform for my company with member profiles",
+    "we are looking for a community platform for my startup for networking between members",
+    "how do I build an online community for a brand community",
+    "can anyone suggest a a white label community platform for a professional network that supports paid memberships",
+    "best community platform for a global community with member profiles",
+    "a customer community platform for my business that keeps members active",
+    "we are looking for a community platform for an AI community for networking between members",
+    "a white label community platform for remote teams and members for customer engagement",
+    "best community platform for founders that is more focused than Slack",
+    "best community platform for a membership business with organized discussions",
+    "looking to switch to a platform for building an online community for investors and founders with member profiles",
+    "we are looking for a community platform for our customers that keeps members active",
+    "best community platform for our customers with better engagement",
+    "where can I find a a platform to create a niche community for a global community with events and community management",
+    "a community platform for my audience for a local community with private spaces",
+    "best community platform for remote teams and members for customer engagement",
+    "best community platform for an agency without using Discord",
+    "a better alternative to Slack communities for founders with private spaces",
+    "searching for a modern community app for remote teams and members that can scale with our community",
+    "a community platform for my audience for alumni that can scale with our community",
+    "considering a community software for a creator community that helps build stronger member relationships",
+    "recommendations for a community platform for a paid membership",
+    "best community platform for a brand community with organized discussions",
+    "a community software for an e-commerce brand that supports paid memberships",
+    "want a community platform for conversations for a global community without relying on Facebook",
+    "a platform for a free community for my business that works on web and mobile",
+    "a place to host my community for investors and founders that is easy to set up",
+    "best community platform for a gaming community with events and community management",
+    "a platform to create a niche community for a membership business for networking between members",
+    "best community platform for a global community that keeps members active",
+    "searching for a platform for a free community for students that gives us ownership of our community",
+    "we are looking for a community platform for a brand community that is easy for members to use",
+    "where can I find a a platform for a free community for founders that supports paid memberships",
+    "best community platform for a creator community with real-time chat",
+    "we are looking for a community platform for a coaching business for meaningful discussions",
+    "does anyone know a a platform to connect members for students with groups and channels",
+    "considering a community platform with mobile app for remote teams and members with a clean user experience",
+    "does anyone know a a community platform with AI for an event community without using Discord",
+    "does anyone know a a platform where members can talk and connect for a professional network with private spaces",
+    "does anyone know a a community software for founders that is easy to set up",
+    "a platform for a free community for a professional network with events and community management",
+    "does anyone know a a community platform for conversations for my business that does not feel like a social media feed",
+    "a community platform for a professional network that is more focused than Slack",
+    "best community platform for an e-commerce brand that does not feel like a social media feed",
+    "a community platform for conversations for a gaming community with events and community management",
+    "trying to find a platform for a free community for a gaming community where conversations do not get lost",
+    "a platform for a free community for a nonprofit with private spaces",
+    "we are looking for a community platform for a brand community with private spaces",
+    "a platform where members can talk and connect for a professional network that supports onboarding new members",
+    "a private community platform for a global community for networking between members",
+    "looking for a white label community platform for our users with member profiles",
+    "recommend a a community software for alumni without using Discord",
+    "thinking about building a community for a local community",
+    "we are looking for a community platform for a nonprofit with private spaces",
+    "a private community platform for a paid membership for customer engagement",
+    "best community platform for my company with organized discussions",
+    "does anyone know a a modern community app for a global community that is more focused than Slack",
+    "recommendations for a community platform for our customers",
+    "want a platform for building an online community for students that supports onboarding new members",
+    "we are looking for a community platform for investors and founders that supports onboarding new members",
+    "a better alternative to Discord for founders without relying on Facebook",
+    "looking for a modern community app for my startup that supports paid memberships",
+    "best community platform for a paid membership that works on web and mobile",
+    "need a white label community platform for a B2B community that is easy for members to use",
+    "a community platform for conversations for my company that is easy to set up",
+    "how do I build an online community for a paid membership",
+    "a private community platform for an AI community that works on web and mobile",
+    "a platform for a free community for an agency with real-time chat",
+    "best community platform for a gaming community with a clean user experience",
+    "best community platform for a coaching business that supports paid memberships",
+    "considering a platform to connect members for a coaching business that gives us ownership of our community",
+    "we are looking for a community platform for an AI community with better community analytics",
+    "what is the best a community management platform for founders for networking between members",
+    "best community platform for founders that works on web and mobile",
+    "best community platform for students that has good moderation tools",
+    "best community platform for remote teams and members with organized discussions",
+    "we are looking for a community platform for a paid membership with real-time chat",
+    "recommendations for a community platform for a nonprofit",
+    "we are looking for a community platform for students that gives us ownership of our community",
+    "a community software for founders for networking between members",
+    "best community platform for creators that is more focused than Slack",
+    "a community platform for conversations for a paid membership that is easy for members to use",
+    "a community software for developers that does not feel like a social media feed",
+    "best community platform for an agency that has good moderation tools",
+    "a platform to create a niche community for our customers with private spaces",
+    "a customer community platform for alumni that is easy to set up",
+    "does anyone know a a platform to create a niche community for my company that is easy to set up",
+    "we are looking for a community platform for founders with organized discussions",
+    "trying to find a platform for a paid community for a professional network without using Discord",
+    "a simple community platform for a nonprofit with organized discussions",
+    "best community platform for my company that works on web and mobile",
+    "best community platform for an e-commerce brand that supports paid memberships",
+    "want a simple community platform for an event community with a clean user experience",
+    "does anyone know a a community management platform for a gaming community with better engagement",
+    "need a platform to create a niche community for a professional network with a clean user experience",
+    "any recommendations for a community platform with mobile app for a paid membership that supports paid memberships",
+    "best community platform for developers that keeps members active",
+    "an online community platform for our customers that is more focused than Slack",
+    "a platform for a paid community for a coaching business with member profiles",
+    "we are looking for a community platform for a B2B community that works on web and mobile",
+    "a private community platform for my business that is easy for members to use",
+    "recommend a a platform for a free community for a brand community that gives us ownership of our community",
+    "searching for a place to host my community for our SaaS customers that is easy to set up",
+    "a better alternative to Facebook Groups for an agency with member profiles",
+    "a community software for an agency with private spaces",
+    "a white label community platform for entrepreneurs that is easy for members to use",
+    "we are looking for a community platform for my startup with real-time chat",
+    "we are looking for a community platform for our customers that gives us ownership of our community",
+    "how do I build an online community for developers",
+    "anyone using a community platform for an e-commerce brand",
+    "need help finding a platform for a paid community for students that has good moderation tools",
+    "recommend a a community platform with AI for my company with member profiles",
+    "best community platform for an e-commerce brand with private spaces",
+    "any recommendations for an affordable community platform for developers that keeps members active",
+    "best community platform for alumni for networking between members",
+    "we are looking for a community platform for developers that keeps members active",
+    "a better alternative to Slack communities for a coaching business that keeps members active",
+    "searching for a community software for our users that gives us ownership of our community",
+    "we are looking for a community platform for a gaming community for meaningful discussions",
+    "we are looking for a community platform for our customers without using Discord",
+    "we are looking for a community platform for alumni with groups and channels",
+    "we are looking for a community platform for my startup that is easy to set up",
+    "a platform for a paid community for a gaming community that is easy to set up",
+    "looking to switch to a customer community platform for my business with events and community management",
+    "a platform for a free community for a global community for customer engagement",
+    "a community platform with AI for product users that supports onboarding new members",
+    "looking to switch to a community platform with mobile app for our users that keeps members active",
+    "best community platform for a brand community that works on web and mobile",
+    "best community platform for a coaching business that is more focused than Slack",
+    "best community platform for investors and founders where conversations do not get lost",
+    "a platform where members can talk and connect for remote teams and members that is easy to set up",
+    "best community platform for a B2B community that supports onboarding new members",
+    "we are looking for a community platform for a coaching business with private spaces",
+    "an affordable community platform for a paid membership with member profiles",
+    "where can I find a a white label community platform for product users with better community analytics",
+    "a white label community platform for our customers that supports paid memberships",
+    "we are looking for a community platform for a nonprofit that is more focused than Slack",
+    "can anyone suggest a a place to host my community for entrepreneurs with organized discussions",
+    "we are looking for a community platform for my company that is easy to set up",
+    "does anyone know a a customer community platform for entrepreneurs that works on web and mobile",
+    "we are looking for a community platform for students without relying on Facebook",
+    "we are looking for a community platform for our customers that supports paid memberships",
+    "can anyone suggest a a community platform with AI for a global community that is more focused than Slack",
+    "a community platform with AI for our users with private spaces",
+    "best community platform for a professional network for meaningful discussions",
+    "looking for a community solution for our customers with organized discussions",
+    "a community platform with chat for a paid membership that supports paid memberships",
+    "does anyone know a a community software for a paid membership with better community analytics",
+    "trying to find a branded community platform for my startup without using Discord",
+    "recommend a a platform for building an online community for a brand community with better community analytics",
+    "trying to find a community management platform for a professional network for customer engagement",
+    "a white label community platform for an online course that is more focused than Slack",
+    "a modern community app for a creator community without relying on Facebook",
+    "best community platform for a B2B community with organized discussions",
+    "we are looking for a community platform for an AI community with better engagement",
+    "what is the best a platform to connect members for a nonprofit that has good moderation tools",
+    "can anyone suggest a a modern community app for founders that works on web and mobile",
+    "a community management platform for a creator community with a clean user experience",
+    "thinking about building a community for our customers",
+    "need help finding a modern community app for a B2B community that supports paid memberships",
+    "best community platform for students for customer engagement",
+    "a platform to connect members for developers with a clean user experience",
+    "a community platform with mobile app for remote teams and members that works on web and mobile",
+    "best community platform for a B2B community with groups and channels",
+    "anyone using a community platform for a brand community",
+    "a community solution for a membership business that works on web and mobile",
+    "a community platform with AI for a gaming community that gives us ownership of our community",
+    "we are looking for a community platform for a brand community that has good moderation tools",
+    "looking for a private community platform for my startup without using Discord",
+    "a community platform with chat for a gaming community that keeps members active",
+    "best community platform for our customers with organized discussions",
+    "how do I build an online community for students",
+    "what is the best a platform where members can talk and connect for my company that supports paid memberships",
+    "a simple community platform for my startup that is easy for members to use",
+    "searching for a place to host my community for an online course that has good moderation tools",
+    "a community platform for my audience for alumni that is easy to set up",
+    "best community platform for my company that is easy for members to use",
+    "recommend a a customer community platform for an event community that helps build stronger member relationships",
+    "how do I build an online community for our users",
+    "we are looking for a community platform for alumni that gives us ownership of our community",
+    "best community platform for my business without using Discord",
+    "want a platform for building an online community for our SaaS customers where conversations do not get lost",
+    "recommendations for a community platform for a membership business",
+    "looking for a branded community platform for an e-commerce brand for customer engagement",
+    "best community platform for a coaching business with groups and channels",
+    "a community platform for creators with a clean user experience",
+    "best community platform for creators with events and community management",
+    "what is the best a better alternative to Facebook Groups for a nonprofit that does not feel like a social media feed",
+    "a place to host my community for a professional network that is easy for members to use",
+    "we are looking for a community platform for a local community with better community analytics",
+    "need a white label community platform for a local community with private spaces",
+    "want a community platform with chat for a gaming community with member profiles",
+    "what is the best a community platform for conversations for an AI community with groups and channels",
+    "can anyone suggest a a simple community platform for an event community that supports onboarding new members",
+    "best community platform for a gaming community where conversations do not get lost",
+    "we are looking for a community platform for an online course that works on web and mobile",
+    "we are looking for a community platform for entrepreneurs that helps build stronger member relationships",
+    "need help finding a simple community platform for a membership business that is easy for members to use",
+    "a community software for founders that supports onboarding new members",
+    "a platform for a paid community for a membership business that is easy for members to use",
+    "need help finding a customer community platform for an agency that is easy for members to use",
+    "we are looking for a community platform for alumni where conversations do not get lost",
+    "how do I build an online community for a creator community",
+    "best community platform for our SaaS customers that keeps members active",
+    "a better alternative to Discord for our SaaS customers that does not feel like a social media feed",
+    "a private community platform for a paid membership that helps build stronger member relationships",
+    "a branded community platform for a nonprofit with events and community management",
+    "a private community platform for an online course that supports paid memberships",
+    "a community platform with AI for a local community with groups and channels",
+    "best community platform for creators that helps build stronger member relationships",
+    "a community platform for my audience for founders with real-time chat",
+    "a simple community platform for my company that can scale with our community",
+    "a place to host my community for a coaching business where conversations do not get lost",
+    "considering a place to host my community for our SaaS customers that helps build stronger member relationships",
+    "a branded community platform for an AI community with organized discussions",
+    "we are looking for a community platform for an agency with better engagement",
+    "best community platform for our users with events and community management",
+    "a white label community platform for a local community that can scale with our community",
+    "best community platform for an online course with private spaces",
+    "need help finding a platform to create a niche community for a coaching business that is easy to set up",
+    "a better alternative to Slack communities for a brand community with private spaces",
+    "we are looking for a community platform for product users that does not feel like a social media feed",
+    "best community platform for an AI community that helps build stronger member relationships",
+    "can anyone suggest a a modern community app for a membership business without relying on Facebook",
+    "looking to switch to a community platform with AI for a paid membership with a clean user experience",
+    "best community platform for creators with better engagement",
+    "any recommendations for a community platform with chat for our users with events and community management",
+    "a community platform for my audience for a coaching business without using Discord",
+    "a place to host my community for a creator community where conversations do not get lost",
+    "want a community platform for our SaaS customers with member profiles",
+    "best community platform for an online course that can scale with our community",
+    "looking for a customer community platform for our users that works on web and mobile",
+    "considering a community platform for conversations for our users that does not feel like a social media feed",
+    "best community platform for investors and founders that is easy for members to use",
+    "best community platform for alumni with member profiles",
+    "considering a better alternative to Discord for alumni that is easy for members to use",
+    "a simple community platform for a gaming community with a clean user experience",
+    "best community platform for a professional network with a clean user experience",
+    "we are looking for a community platform for remote teams and members with better engagement",
+    "we are looking for a community platform for developers without using Discord",
+    "a community platform with AI for founders with member profiles",
+    "need help finding a community platform for our SaaS customers with member profiles",
+    "how do I build an online community for my business",
+    "a community platform with chat for a global community that is easy to set up",
+    "where can I find a an affordable community platform for my startup that works on web and mobile",
+    "we are looking for a community platform for an event community with organized discussions",
+    "a community management platform for developers that keeps members active",
+    "we are looking for a community platform for a coaching business without using Discord",
+    "where can I find a an online community platform for a nonprofit that supports onboarding new members",
+    "recommend a a platform to create a niche community for our SaaS customers with private spaces",
+    "need help finding a platform for building an online community for an online course where conversations do not get lost",
+    "best community platform for a nonprofit that has good moderation tools",
+    "a community platform with chat for a B2B community that helps build stronger member relationships",
+    "can anyone suggest a a community platform with mobile app for our users that gives us ownership of our community",
+    "a community management platform for our customers that has good moderation tools",
+    "we are looking for a community platform for an online course that supports paid memberships",
+    "best community platform for a nonprofit with groups and channels",
+    "an affordable community platform for our SaaS customers with organized discussions",
+    "recommend a a community solution for my business where conversations do not get lost",
+    "a private community platform for a global community where conversations do not get lost",
+    "a modern community app for my startup where conversations do not get lost",
+    "a community platform for conversations for entrepreneurs with better community analytics",
+    "we are looking for a community platform for product users that has good moderation tools",
+    "we are looking for a community platform for my business that does not feel like a social media feed",
+    "we are looking for a community platform for my startup that supports onboarding new members",
+    "we are looking for a community platform for an online course that can scale with our community",
+    "a customer community platform for entrepreneurs that keeps members active",
+    "a customer community platform for a creator community with better engagement",
+    "how do I build an online community for alumni",
+    "a customer community platform for entrepreneurs that supports paid memberships",
+    "a platform for building an online community for developers that is easy to set up",
+    "best community platform for entrepreneurs that gives us ownership of our community",
+    "need a simple community platform for a global community for networking between members",
+    "looking to switch to a community management platform for a global community with better engagement",
+    "any recommendations for a community platform for developers that does not feel like a social media feed",
+    "what is the best a platform for a free community for investors and founders that does not feel like a social media feed",
+    "looking to switch to an online community platform for a local community that is easy to set up",
+    "best community platform for a nonprofit with organized discussions",
+    "searching for a customer community platform for alumni that works on web and mobile",
+    "a community software for founders for meaningful discussions",
+    "best community platform for a global community that has good moderation tools",
+    "an affordable community platform for our customers with better community analytics",
+    "we are looking for a community platform for a brand community that supports paid memberships",
+    "looking to switch to a platform for building an online community for product users without relying on Facebook",
+    "an online community platform for an agency with real-time chat",
+    "an affordable community platform for an agency for networking between members",
+    "a branded community platform for developers that can scale with our community",
+    "need help finding a platform for a free community for a gaming community with groups and channels",
+    "we are looking for a community platform for remote teams and members that can scale with our community",
+    "thinking about building a community for remote teams and members",
+    "best community platform for an AI community that does not feel like a social media feed",
+    "looking for a customer community platform for my business that has good moderation tools",
+    "considering a community platform for conversations for investors and founders that works on web and mobile",
+    "what is the best a platform for a paid community for a gaming community that gives us ownership of our community",
+    "best community platform for a nonprofit that supports onboarding new members",
+    "best community platform for alumni that is easy to set up",
+    "we are looking for a community platform for my startup that keeps members active",
+    "a better alternative to Facebook Groups for alumni that has good moderation tools",
+    "best community platform for an event community without using Discord",
+    "want a simple community platform for our customers that does not feel like a social media feed",
+    "trying to find a community platform for conversations for a professional network with real-time chat",
+    "we are looking for a community platform for students that is easy to set up",
+    "a platform for a free community for an e-commerce brand where conversations do not get lost",
+    "an online community platform for an AI community that supports onboarding new members",
+    "a community platform for conversations for a coaching business that is easy to set up",
+    "a better alternative to Discord for a local community where conversations do not get lost",
+    "we are looking for a community platform for a creator community with better engagement",
+    "best community platform for an online course that keeps members active",
+    "we are looking for a community platform for our SaaS customers that can scale with our community",
+    "what is the best a community solution for our users where conversations do not get lost",
+    "a customer community platform for a professional network that supports paid memberships",
+    "want a community management platform for a brand community that does not feel like a social media feed",
+    "best community platform for a B2B community that works on web and mobile",
+    "an online community platform for a global community that helps build stronger member relationships",
+    "a modern community app for students that can scale with our community",
+    "thinking about building a community for a creator community",
+    "need a place to host my community for my company that has good moderation tools",
+    "best community platform for our SaaS customers without using Discord",
+    "a better alternative to Discord for a gaming community that can scale with our community",
+    "an online community platform for an event community that helps build stronger member relationships",
+    "best community platform for my company for meaningful discussions",
+    "a community platform for my audience for developers with organized discussions",
+    "a platform to connect members for alumni for meaningful discussions",
+    "considering a customer community platform for our customers with member profiles",
+    "recommend a a platform for a paid community for entrepreneurs with member profiles",
+    "we are looking for a community platform for an event community that supports paid memberships",
+    "a better alternative to Discord for students that is more focused than Slack",
+    "trying to find a customer community platform for a professional network that can scale with our community",
+    "how do I build an online community for my company",
+    "best community platform for creators that works on web and mobile",
+    "we are looking for a community platform for a gaming community for networking between members",
+    "a modern community app for our customers that gives us ownership of our community",
+    "a better alternative to Slack communities for remote teams and members with better community analytics",
+    "a private community platform for a brand community for networking between members",
+    "we are looking for a community platform for creators that keeps members active",
+    "recommend a a better alternative to Discord for an e-commerce brand that gives us ownership of our community",
+    "best community platform for my business with better community analytics",
+    "best community platform for my startup without using Discord",
+    "we are looking for a community platform for a brand community for meaningful discussions",
+    "looking for a modern community app for entrepreneurs that does not feel like a social media feed",
+    "a community management platform for creators that has good moderation tools",
+    "anyone using a community platform for a local community",
+    "recommendations for a community platform for creators",
+    "a place to host my community for a professional network for meaningful discussions",
+    "we are looking for a community platform for an e-commerce brand with member profiles",
+    "we are looking for a community platform for a creator community that helps build stronger member relationships",
+    "can anyone suggest a a platform to connect members for an online course that works on web and mobile",
+    "a community platform for my audience for my business that supports onboarding new members",
+    "we are looking for a community platform for a paid membership that is more focused than Slack",
+    "a community solution for a local community without relying on Facebook",
+    "recommend a a community software for our SaaS customers that keeps members active",
+    "we are looking for a community platform for product users with organized discussions",
+    "how do I build an online community for creators",
+    "we are looking for a community platform for a nonprofit that has good moderation tools",
+    "best community platform for remote teams and members with better engagement",
+    "a platform for a free community for a nonprofit that works on web and mobile",
+    "we are looking for a community platform for a brand community that gives us ownership of our community",
+    "best community platform for investors and founders for networking between members",
+    "we are looking for a community platform for creators that has good moderation tools",
+    "best community platform for an online course that has good moderation tools",
+    "best community platform for an AI community with events and community management",
+    "we are looking for a community platform for an online course with a clean user experience",
+    "anyone using a community platform for my startup",
+    "we are looking for a community platform for my business for customer engagement",
+    "a better alternative to Slack communities for my startup that is easy for members to use",
+    "we are looking for a community platform for remote teams and members that keeps members active",
+    "best community platform for an AI community where conversations do not get lost",
+    "looking to switch to a better alternative to Facebook Groups for a local community that helps build stronger member relationships",
+    "best community platform for a brand community with groups and channels",
+    "what is the best a simple community platform for a global community that does not feel like a social media feed",
+    "where can I find a a platform for building an online community for creators that gives us ownership of our community",
+    "recommendations for a community platform for a brand community",
+    "best community platform for an AI community that is easy for members to use",
+    "best community platform for our customers that gives us ownership of our community",
+    "can anyone suggest a a better alternative to Discord for an online course that supports paid memberships",
+    "an online community platform for our users that supports onboarding new members",
+    "where can I find a a community software for a global community with member profiles",
+    "a community software for a brand community that helps build stronger member relationships",
+    "where can I find a a modern community app for alumni with events and community management",
+    "searching for a community management platform for my startup for networking between members",
+    "best community platform for our customers with real-time chat",
+    "a platform for a free community for an event community that can scale with our community",
+    "we are looking for a community platform for alumni that does not feel like a social media feed",
+    "a better alternative to Facebook Groups for a professional network for meaningful discussions",
+    "best community platform for a paid membership for customer engagement",
+    "where can I find a a platform for a paid community for product users that keeps members active",
+    "best community platform for product users without using Discord",
+    "anyone using a community platform for a professional network",
+    "a simple community platform for developers with member profiles",
+    "best community platform for our customers without relying on Facebook",
+    "can anyone suggest a a platform where members can talk and connect for alumni where conversations do not get lost",
+    "we are looking for a community platform for my startup that helps build stronger member relationships",
+    "looking to switch to a community platform with AI for a nonprofit that has good moderation tools",
+    "does anyone know a an affordable community platform for founders for networking between members",
+    "a platform for a free community for a paid membership that keeps members active",
+    "best community platform for product users that is easy for members to use",
+    "we are looking for a community platform for a local community where conversations do not get lost",
+    "a modern community app for an AI community with organized discussions",
+    "a community platform for conversations for a membership business for meaningful discussions",
+    "what is the best a better alternative to Discord for our customers that can scale with our community",
+    "recommendations for a community platform for a professional network",
+    "what is the best a private community platform for a local community that keeps members active",
+    "a community platform for my audience for our users that keeps members active",
+    "we are looking for a community platform for a membership business that is easy for members to use",
+    "a community platform for a brand community with better community analytics",
+    "best community platform for product users that helps build stronger member relationships",
+    "recommendations for a community platform for alumni",
+    "looking for a platform to connect members for our users that keeps members active",
+    "a better alternative to Discord for a local community that is easy for members to use",
+    "looking for a community solution for our SaaS customers with better community analytics",
+    "a community platform with mobile app for a local community for networking between members",
+    "a better alternative to Facebook Groups for an event community that is easy to set up",
+    "we are looking for a community platform for creators that is more focused than Slack",
+    "trying to find a better alternative to Slack communities for investors and founders with better community analytics",
+    "trying to find a community platform with chat for creators with better engagement",
+    "a platform to connect members for a brand community that supports paid memberships",
+    "need help finding a better alternative to Facebook Groups for my company with organized discussions",
+    "a community software for alumni that supports paid memberships",
+    "we are looking for a community platform for investors and founders with real-time chat",
+    "we are looking for a community platform for an event community for customer engagement",
+    "we are looking for a community platform for a brand community without relying on Facebook",
+    "searching for a branded community platform for my company where conversations do not get lost",
+    "we are looking for a community platform for our SaaS customers with groups and channels",
+    "best community platform for entrepreneurs that helps build stronger member relationships",
+    "we are looking for a community platform for product users without using Discord",
+    "need help finding a modern community app for entrepreneurs where conversations do not get lost",
+    "a platform to connect members for alumni without relying on Facebook",
+    "a community platform with chat for creators for networking between members",
+    "we are looking for a community platform for a B2B community with real-time chat",
+    "need help finding an online community platform for a paid membership that helps build stronger member relationships",
+    "a modern community app for an e-commerce brand that is easy for members to use",
+    "what is the best a private community platform for founders that supports paid memberships",
+    "a platform for a free community for a coaching business with groups and channels",
+    "how do I build an online community for an agency",
+    "best community platform for our users for customer engagement",
+    "we are looking for a community platform for our customers with events and community management",
+    "need a platform for a paid community for an e-commerce brand for meaningful discussions",
+    "a better alternative to Slack communities for our customers that supports paid memberships",
+    "best community platform for a gaming community that is more focused than Slack",
+    "searching for a community platform for my audience for our SaaS customers with private spaces"
+            
+            ],
+    },
+}
+
+OTHER_INDUSTRY_KEY = "other"
+OTHER_INDUSTRY_LABEL = "Other"
+
+INDUSTRY_KEYS_IN_ORDER = list(INDUSTRIES.keys()) + [OTHER_INDUSTRY_KEY]
+INDUSTRY_LABELS = {k: v["label"] for k, v in INDUSTRIES.items()}
+INDUSTRY_LABELS[OTHER_INDUSTRY_KEY] = OTHER_INDUSTRY_LABEL
+
+# Precompiled, case-insensitive, WORD-BOUNDARY regex per keyword (instead of
+# raw substring search). This avoids false positives like a bare "crm"
+# keyword matching inside an unrelated word, and works fine for multi-word
+# phrases too since \b anchors on the phrase's own edges. With the keyword
+# lists emptied out, every industry's pattern list is simply empty until you
+# re-populate INDUSTRIES[...]["keywords"] yourself.
+_INDUSTRY_PATTERNS = {
+    key: [
+        (kw, re.compile(r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])", re.IGNORECASE))
+        for kw in cfg["keywords"]
+    ]
+    for key, cfg in INDUSTRIES.items()
+}
 
 
-async def verify_api_key(
-    key_header: str = Security(api_key_header),
-    key_query:  str = Security(api_key_query),
-):
-    if not API_KEY:
+def _first_available(doc: dict, field_candidates) -> str:
+    """Return the first non-empty string value found among field_candidates
+    on doc, or '' if none of them are available."""
+    for field in field_candidates:
+        value = doc.get(field)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            return value
+    return ""
+
+
+def _match_industry_from_string(s: str):
+    """
+    Match s against every industry's keyword list using precompiled,
+    case-insensitive, word-boundary regex patterns (not raw substring
+    search — avoids false hits like "crm" matching inside an unrelated
+    word). Each industry's score is the sum of the *character length* of
+    every keyword that matched, not just a hit count — so one specific,
+    multi-word match (e.g. "applicant tracking system") outweighs a
+    handful of generic single-word coincidences, which is what you want
+    when classifying real post text at scale.
+
+    Returns the industry key with the highest score, or None if nothing
+    matched anywhere.
+    """
+    if not s:
+        return None
+    best_key, best_score = None, 0
+    for key, patterns in _INDUSTRY_PATTERNS.items():
+        score = sum(len(kw) for kw, pattern in patterns if pattern.search(s))
+        if score > best_score:
+            best_key, best_score = key, score
+    return best_key
+
+
+def _classify_industry_with_source(doc: dict):
+    """
+    Same rule as classify_industry(), but also returns the raw value that
+    decided the bucket when a doc lands in "Other" — this is what powers
+    the "what's actually inside Other" breakdown on the dashboard:
+      1. If the search_keyword-style field is AVAILABLE, use it and ONLY
+         it. If it doesn't match any industry -> "Other", and the raw
+         keyword value itself is returned as the source.
+      2. If that field is UNAVAILABLE, fall back to the post's own text.
+         If that doesn't match any industry either -> "Other", and the
+         (truncated) text is returned as the source.
+      3. If a match IS found (either source), no source is returned —
+         the breakdown only needs to explain *unmatched* signals.
+    Returns: (industry_key, other_source_value_or_None)
+    """
+    keyword_value = _first_available(doc, KEYWORD_FIELD_CANDIDATES)
+    if keyword_value:
+        matched = _match_industry_from_string(keyword_value)
+        if matched:
+            return matched, None
+        return OTHER_INDUSTRY_KEY, keyword_value
+
+    text_value = _first_available(doc, TEXT_FIELD_CANDIDATES)
+    if text_value:
+        matched = _match_industry_from_string(text_value)
+        if matched:
+            return matched, None
+        return OTHER_INDUSTRY_KEY, text_value
+
+    return OTHER_INDUSTRY_KEY, None
+
+
+def classify_industry(doc: dict) -> str:
+    """
+    Industry classification for one signal doc:
+      1. If the search_keyword-style field is AVAILABLE on the doc, use it
+         and ONLY it — match it against the industry keyword lists, and
+         if it doesn't match anything, bucket as "Other". Post text is
+         NOT consulted in this case, even if it would have matched.
+      2. If the search_keyword-style field is UNAVAILABLE (missing/null/
+         empty) on the doc, fall back to matching against the post's own
+         text field instead.
+      3. If neither source is available/matches, bucket as "Other".
+    """
+    industry, _source = _classify_industry_with_source(doc)
+    return industry
+
+
+# Tally of raw values (search_keyword, or post text when the keyword field
+# is unavailable) that landed in "Other", so the dashboard can show *what*
+# is actually inside that bucket instead of just a count. Capped so a very
+# long-tail of distinct one-off values can't grow this unbounded — once the
+# cap is hit, only counts for values already being tracked keep incrementing;
+# brand-new distinct values are folded into an "(others)" catch-all entry
+# instead of being dropped silently.
+OTHER_BREAKDOWN_MAX_DISTINCT_VALUES = int(os.getenv("OTHER_BREAKDOWN_MAX_DISTINCT_VALUES", "300"))
+OTHER_BREAKDOWN_MAX_VALUE_LENGTH    = int(os.getenv("OTHER_BREAKDOWN_MAX_VALUE_LENGTH", "80"))
+OTHER_BREAKDOWN_TOP_N               = int(os.getenv("OTHER_BREAKDOWN_TOP_N", "10"))
+OTHER_BREAKDOWN_OVERFLOW_LABEL      = "(other distinct values)"
+
+other_breakdown: dict = {}
+
+
+def _normalize_other_value(raw_value: str) -> str:
+    value = " ".join(raw_value.split())  # collapse whitespace/newlines
+    if len(value) > OTHER_BREAKDOWN_MAX_VALUE_LENGTH:
+        value = value[:OTHER_BREAKDOWN_MAX_VALUE_LENGTH].rstrip() + "…"
+    return value
+
+
+def _record_other_breakdown(raw_value: str):
+    if not raw_value:
         return
-    if key_header == API_KEY or key_query == API_KEY:
+    value = _normalize_other_value(raw_value)
+    if value in other_breakdown:
+        other_breakdown[value] += 1
         return
-    raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Invalid or missing API key.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PLATFORM ENABLE / DISABLE FLAGS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _bool_env(key: str, default: bool = True) -> bool:
-    val = os.getenv(key, str(default)).strip().lower()
-    return val in ("1", "true", "yes", "on")
-
-REDDIT_ENABLED  = _bool_env("REDDIT_ENABLED",  True)
-TWITTER_ENABLED = _bool_env("TWITTER_ENABLED", False)
-
-
-def _working(flag: bool) -> str:
-    return "✅ Working" if flag else "❌ Not Working"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GENERIC JSON FIELD-EXTRACTION HELPERS — unchanged from v9.6.
-#
-# These exist because RapidAPI marketplace providers do NOT guarantee a
-# fixed response schema the way DataForSEO's own API does. The old code
-# assumed exact key names ("rank_absolute", "search_volume", "results")
-# and silently returned None forever when the provider used a different
-# name. _dig_value()/_dig_list() search across a list of candidate key
-# names, at the top level and one level of nesting, so a provider's real
-# field naming is found instead of guessed-and-missed.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _dig_value(obj, candidate_keys: list):
-    """
-    Searches `obj` (a dict, or a list of dicts) for the first present key
-    from `candidate_keys`, checking the top level first, then one level
-    of nested dict/list values. Returns the first match's value, or None
-    if nothing matches. Purely additive/defensive — never raises.
-    """
-    if obj is None:
-        return None
-
-    def _try_dict(d):
-        if not isinstance(d, dict):
-            return None
-        for key in candidate_keys:
-            if key in d and d[key] is not None:
-                return d[key]
-        return None
-
-    # top-level dict
-    if isinstance(obj, dict):
-        val = _try_dict(obj)
-        if val is not None:
-            return val
-        # one level of nesting inside any dict/list value
-        for v in obj.values():
-            if isinstance(v, dict):
-                val = _try_dict(v)
-                if val is not None:
-                    return val
-            elif isinstance(v, list) and v:
-                first = v[0]
-                if isinstance(first, dict):
-                    val = _try_dict(first)
-                    if val is not None:
-                        return val
-
-    # top-level list of dicts (take the first element)
-    elif isinstance(obj, list) and obj:
-        first = obj[0]
-        if isinstance(first, dict):
-            val = _try_dict(first)
-            if val is not None:
-                return val
-
-    return None
-
-
-def _dig_list(obj, candidate_list_keys: list) -> list:
-    """
-    Searches a RapidAPI JSON response for the results/organic-results
-    list, trying several common key names used across different
-    providers ("results", "organic_results", "items", "data", "items",
-    "organic", "response"). Falls back to: if `obj` itself is already a
-    list, return it as-is. Returns [] if nothing usable is found —
-    never raises.
-    """
-    if isinstance(obj, list):
-        return obj
-    if not isinstance(obj, dict):
-        return []
-    for key in candidate_list_keys:
-        val = obj.get(key)
-        if isinstance(val, list):
-            return val
-        if isinstance(val, dict):
-            # some providers nest one level deeper, e.g. {"data": {"results": [...]}}
-            for inner_key in candidate_list_keys:
-                inner_val = val.get(inner_key)
-                if isinstance(inner_val, list):
-                    return inner_val
-    return []
-
-
-# Candidate field names for a per-result Google rank/position.
-RANK_FIELD_CANDIDATES = [
-    "rank_absolute", "rank", "position", "google_rank",
-    "serp_position", "rank_group", "index", "pos",
-]
-
-# Candidate field names for the result-list container.
-RESULT_LIST_KEY_CANDIDATES = [
-    "results", "organic_results", "organic", "items", "data", "response", "hits",
-]
-
-# Candidate field names for monthly search volume.
-VOLUME_FIELD_CANDIDATES = [
-    "search_volume", "searchVolume", "volume", "monthly_searches",
-    "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
-    "avg_search_volume",
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — platform-isolated, NEVER mixed.
-# ─────────────────────────────────────────────────────────────────────────────
-
-reddit_queue:  queue.Queue = queue.Queue()
-twitter_queue: queue.Queue = queue.Queue()
-
-
-def passes_keyword_filter(text: str, keywords: list) -> bool:
-    """Generic keyword gate — takes an explicit keyword list so Reddit
-    and Twitter can be filtered against their own independent lists."""
-    t = text.lower()
-    for kw in keywords:
-        if kw.lower() in t:
-            return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY — built directly from TWITTER_SEARCH_KEYWORDS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_twitter_search_query() -> str:
-    if not TWITTER_SEARCH_KEYWORDS:
-        return (
-            "(\"international transfer\" OR \"bank blocked\" OR \"we got hacked\""
-            " OR \"CRM is a nightmare\") -is:retweet lang:en"
-        )
-    parts = [f'"{kw}"' if " " in kw else kw for kw in TWITTER_SEARCH_KEYWORDS]
-    query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-    log.info(f"Twitter search query built | terms:{len(parts)} | len:{len(query)}")
-    return query
-
-
-TWITTER_SEARCH_QUERY = _build_twitter_search_query()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE PROMPT — generic, niche-agnostic (unchanged schema)
-# ─────────────────────────────────────────────────────────────────────────────
-
-CLAUDE_SYSTEM_PROMPT = """
-You are Flintel's signal intelligence analyst.
-
-Your job is to read one social media post (Reddit or X), together with
-its metadata and the industry it was matched against, and produce two
-things:
-
-1. An intent_score from 1 to 100, built from three weighted components
-2. A short, human-written-style reply draft the end user can personalize
-   and post themselves, in their own voice, from their own account
-
-You score using the industry context you are given. You are never told
-the specific company or product this is for — only the industry
-category (e.g. "fintech_payments", "cybersecurity", "crm_sales_tools",
-"logistics", "recruitment_hr", "accounting_software"). Two posts using
-identical words ("hidden fees are killing us") can score very
-differently depending on whether the industry context is fintech
-billing versus logistics freight surcharges — use the industry field to
-judge whether the post's actual subject matches that vertical's real
-buyer pain, not just shared vocabulary.
-
-═══════════════════════════════════════════════════════════════════════
-INPUT YOU WILL RECEIVE, PER POST
-═══════════════════════════════════════════════════════════════════════
-- platform: "reddit" | "x"
-- industry: one of the six category strings above
-- search_keyword: the phrase this post was matched against
-- post_text: the raw post content
-- google_rank: integer, or null (X posts will almost always be null —
-  see Component 2 below)
-- search_volume: monthly search volume for search_keyword, or null
-- upvotes / likes: integer, platform-appropriate
-- comments: integer
-
-═══════════════════════════════════════════════════════════════════════
-SCORING MODEL — 100 POINTS, THREE COMPONENTS
-═══════════════════════════════════════════════════════════════════════
-
-── COMPONENT 1 — RELEVANCE MATCH (0-40 points) ──────────────────────
-Does this post genuinely discuss the same problem or need as
-search_keyword, interpreted through the lens of the given industry —
-in meaning, not just in shared words?
-
-  36-40  Unambiguously about exactly this problem, in this industry.
-  25-35  Clearly related, but broader, tangential, or partial —
-         e.g. discussing the general category without the specific pain.
-  10-24  Matching words present, but the actual subject differs, OR the
-         pain described belongs to a different industry than the one
-         given (e.g. "hidden fees" post is about parking tickets, not
-         payment processing).
-  0-9    No genuine connection.
-
-THIS COMPONENT IS A HARD GATE.
-If relevance scores below 10: is_relevant = false, and intent_score
-must not exceed 15 — regardless of how strong Component 2 or 3 look.
-A top-ranked, highly-upvoted post about the wrong subject is still a
-wrong-subject post.
-
-── COMPONENT 2 — GOOGLE VISIBILITY (0-30 points) ─────────────────────
-google_rank contribution (0-20):
-  Rank 1        -> 20
-  Rank 2-3      -> 16
-  Rank 4-10     -> 11
-  Rank 11-20    -> 6
-  Not ranked/null -> 0
-
-search_volume contribution (0-10):
-  10,000+/mo    -> 10
-  3,000-9,999   -> 7
-  500-2,999     -> 4
-  Under 500/null -> 1
-
-X-SPECIFIC NOTE: X posts are not Google-indexed the way Reddit threads
-are, so google_rank will almost always be null for platform == "x".
-A null rank on an X post is EXPECTED and is not a quality signal one
-way or the other — do not treat it as a penalty, and do not attempt to
-infer or guess a rank that wasn't provided. Score the 0-point rank
-contribution plainly and let Components 1 and 3 carry that post.
-
-── COMPONENT 3 — ENGAGEMENT SIGNAL (0-30 points) ─────────────────────
-Derived from upvotes/likes and comments, judged proportionally to
-platform norms — the same raw number means different things on
-different platforms.
-
-Reference anchors (interpolate between these, don't treat as rigid
-cutoffs):
-  REDDIT   Strong: 50+ upvotes, 15+ comments      -> 22-30
-           Moderate: 10-49 upvotes, 3-14 comments  -> 10-21
-           Low: under 10 upvotes, under 3 comments -> 0-9
-  X        Strong: 100+ likes, 10+ replies         -> 22-30
-           Moderate: 20-99 likes, 2-9 replies       -> 10-21
-           Low: under 20 likes, under 2 replies     -> 0-9
-  No engagement data provided on either platform    -> 0
-
-FINAL intent_score = Component 1 + Component 2 + Component 3, capped at 100.
-
-═══════════════════════════════════════════════════════════════════════
-WORKED EXAMPLES
-═══════════════════════════════════════════════════════════════════════
-
-Example A — high-scoring, correct industry match
-  Input: platform=reddit, industry=fintech_payments,
-  search_keyword="cross-border payment fees", google_rank=2,
-  search_volume=4200, upvotes=87, comments=22,
-  post_text="Does anyone have a solid alternative to [processor] for
-  cross-border fees? We're getting killed on FX markups every month."
-  Reasoning: Directly about cross-border payment fees in a fintech
-  context (Component 1: 39). Rank 2 + volume 4,200/mo (Component 2:
-  16+7=23). 87 upvotes/22 comments on Reddit is strong (Component 3: 26).
-  Output: intent_score=88, is_relevant=true,
-  reply_draft="Cross-border fees catch a lot of teams off guard —
-  worth checking whether your provider discloses FX markup upfront or
-  buries it in the settlement rate. Have you compared what you're
-  actually losing per transaction?"
-
-Example B — hard-gate failure despite strong surface signals
-  Input: platform=reddit, industry=logistics,
-  search_keyword="hidden fees", google_rank=1, search_volume=8000,
-  upvotes=340, comments=95,
-  post_text="Just found out my city adds a hidden fee to every parking
-  ticket if you pay online. Total scam."
-  Reasoning: Shares the words "hidden fees" but is about parking
-  tickets, not logistics/freight pricing (Component 1: 4 — hard gate
-  triggered). Rank and engagement are irrelevant once the gate fails.
-  Output: intent_score=9, is_relevant=false, reply_draft=null
-
-Example C — X post, no Google rank, still a real match
-  Input: platform=x, industry=cybersecurity,
-  search_keyword="EDR alert fatigue", google_rank=null,
-  search_volume=1400, likes=64, comments=11,
-  post_text="Our SOC ignored a real alert last week because we get 200
-  false positives a day. Something has to change."
-  Reasoning: Directly describes EDR alert fatigue (Component 1: 37).
-  google_rank null is expected for X — score 0 for that piece, but
-  volume 1,400 still contributes (Component 2: 0+4=4). 64 likes/11
-  comments is strong for X (Component 3: 25).
-  Output: intent_score=66, is_relevant=true,
-  reply_draft="200 false positives a day would burn out any team, not
-  just miss the real one. Sounds like the tuning problem is as much
-  the issue as the tool itself — has your team looked at what's driving
-  the noise ratio that high?"
-
-═══════════════════════════════════════════════════════════════════════
-REPLY DRAFT — RULES
-═══════════════════════════════════════════════════════════════════════
-Only generate reply_draft when is_relevant is true. Otherwise: null.
-
-- Generic and honest — never invent a fake personal story, dollar
-  amount, or timeline not present in the input.
-- Acknowledge the poster's situation in one clause, then offer one
-  genuinely useful angle — not a pitch.
-- 2-3 sentences maximum. No links, no "DM me," no product/company name
-  (the end user adds that themselves if relevant).
-- End on warmth or a question, never a call-to-action.
-- AVOID: "I totally understand," "This is so common," or any opener
-  that could paste onto literally any post — anchor the first clause
-  to a specific detail from post_text so it reads as actually read,
-  not templated.
-
-═══════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════════════
-Return ONLY valid JSON. No preamble, no markdown, no code fences.
-Return one object per post, in a JSON array, same order as received.
-
-[
-  {
-    "index": <1-based integer matching input order>,
-    "intent_score": <integer 1-100>,
-    "is_relevant": <true|false>,
-    "reply_draft": "<string, 2-3 sentences, or null if is_relevant is false>"
-  }
-]
-
-Score every post received. Return the same count as received. Never
-omit an item. Never add commentary outside the JSON array.
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — signals collection + persistent batch-state collections +
-# per-keyword fetch-once-forever cache collection (flintel_keywords).
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_database():
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        client.server_info()
-        db = client[MONGODB_DB]
-
-        db.signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
-        db.signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
-        for field in ["intent_score", "created_at", "client_id", "platform", "is_relevant", "status"]:
-            db.signals.create_index([(field, ASCENDING)])
-
-        # persistent batch state — survives restarts, no in-flight batch lost
-        db.flintel_pending_batch.create_index([("platform", ASCENDING)], unique=True, name="platform_unique")
-        db.flintel_seen_ids.create_index([("platform", ASCENDING)], unique=True, name="seen_platform_unique")
-        db.flintel_queue_messages.create_index(
-            [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
-            unique=True, name="queue_platform_message_unique",
-        )
-        db.flintel_batch_seconds.create_index(
-            [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
-        )
-
-        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. Restart-safe: this
-        # collection is the single source of truth for "has this keyword
-        # ever been fetched?" AND "does this keyword already have a cached
-        # search_volume?" It survives process restarts, so a keyword
-        # already marked fetched=True is NEVER re-fetched, ever, and a
-        # keyword that already has a search_volume is NEVER re-queried
-        # for volume, ever. As of v9.11.1, this collection is also the
-        # ONLY thing consulted when deciding what's due / missing volume
-        # — the REDDIT_SEARCH_KEYWORDS python list is never used to
-        # filter these reads, only to decide what to INSERT.
-        db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
-        db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
-        db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
-
-        log.info("MongoDB connected.")
-        return db
-    except Exception as exc:
-        log.critical(f"MongoDB connection failed: {exc}")
-        raise
-
-
-db = get_database()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — streaming
-# ─────────────────────────────────────────────────────────────────────────────
-
-anthropic_client = anthropic.Anthropic(
-    api_key=ANTHROPIC_API_KEY,
-    http_client=httpx.Client(
-        timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=30.0)
-    ),
-)
-
-
-def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            wait = delay * attempt
-            log.error(f"[{label}] attempt {attempt}/{retries} failed: {exc}")
-            if attempt < retries:
-                log.info(f"[{label}] retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                log.critical(f"[{label}] all {retries} attempts failed.")
-                return None
-
-
-def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
-    log.log(
-        logging.CRITICAL if level == "CRITICAL" else logging.ERROR,
-        f"[OPERATOR ALERT] {title} — {detail}",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENT BATCH STATE HELPERS — survives process restarts, so a
-# half-filled batch never disappears.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_pending_batch(platform: str) -> tuple:
-    try:
-        doc = db.flintel_pending_batch.find_one({"platform": platform})
-        if not doc:
-            return [], None
-        items = doc.get("items", [])
-        start_ts = doc.get("batch_start_time")
-        start_time = start_ts.timestamp() if start_ts else None
-        if items:
-            log.warning(f"[{platform.upper()}] Resuming persisted batch | {len(items)} item(s) recovered.")
-        return items, start_time
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_pending_batch error: {exc}")
-        return [], None
-
-
-def save_pending_batch(platform: str, items: list, batch_start_time):
-    try:
-        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
-        db.flintel_pending_batch.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "items": items, "batch_start_time": start_dt,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_pending_batch error: {exc}")
-
-
-def clear_pending_batch(platform: str):
-    try:
-        db.flintel_pending_batch.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "items": [], "batch_start_time": None,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] clear_pending_batch error: {exc}")
-
-
-def load_seen_ids(platform: str) -> set:
-    try:
-        doc = db.flintel_seen_ids.find_one({"platform": platform})
-        return set(doc.get("ids", [])) if doc else set()
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_seen_ids error: {exc}")
-        return set()
-
-
-def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
-    try:
-        id_list = list(ids)
-        if len(id_list) > cap:
-            id_list = id_list[-cap:]
-        db.flintel_seen_ids.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "ids": id_list, "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_seen_ids error: {exc}")
-
-
-def save_queue_message(platform: str, item: dict):
-    try:
-        mid = item.get("message_id")
-        if not mid:
-            return
-        doc = dict(item)
-        doc["_platform_key"] = platform
-        doc["message_id"] = mid
-        doc["queued_at"] = datetime.now(timezone.utc)
-        db.flintel_queue_messages.update_one(
-            {"_platform_key": platform, "message_id": mid}, {"$set": doc}, upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_queue_message error: {exc}")
-
-
-def remove_queue_message(platform: str, message_id: str):
-    if not message_id:
+    if len(other_breakdown) >= OTHER_BREAKDOWN_MAX_DISTINCT_VALUES:
+        other_breakdown[OTHER_BREAKDOWN_OVERFLOW_LABEL] = other_breakdown.get(OTHER_BREAKDOWN_OVERFLOW_LABEL, 0) + 1
         return
-    try:
-        db.flintel_queue_messages.delete_one({"_platform_key": platform, "message_id": message_id})
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] remove_queue_message error: {exc}")
+    other_breakdown[value] = 1
 
 
-def load_queue_messages(platform: str) -> list:
-    try:
-        docs = list(db.flintel_queue_messages.find({"_platform_key": platform}))
-        items = []
-        for d in docs:
-            d.pop("_id", None)
-            d.pop("_platform_key", None)
-            d.pop("queued_at", None)
-            items.append(d)
-        return items
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_queue_messages error: {exc}")
-        return []
-
-
-def save_batch_seconds(platform: str, batch_start_time):
-    try:
-        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
-        db.flintel_batch_seconds.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "batch_start_time": start_dt,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_batch_seconds error: {exc}")
-
-
-def clear_batch_seconds(platform: str):
-    try:
-        db.flintel_batch_seconds.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "batch_start_time": None,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] clear_batch_seconds error: {exc}")
+def _top_other_breakdown() -> list:
+    return [
+        {"value": value, "count": count}
+        for value, count in sorted(other_breakdown.items(), key=lambda kv: kv[1], reverse=True)[:OTHER_BREAKDOWN_TOP_N]
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD CACHE — flintel_keywords collection. FETCH-ONCE-FOREVER design:
-# each keyword gets fetched from DataForSEO exactly ONE time, ever. Once
-# fetched=True, it is PERMANENTLY skipped by get_due_keywords() — no TTL,
-# no re-due date, no 12h/24h re-fetch. This REPLACES the old "sleep 12h
-# then refetch everything from scratch" design AND the TTL-based re-fetch
-# design that came after it:
-#
-#   - New keyword added to REDDIT_SEARCH_KEYWORDS -> sync_keywords_to_db()
-#     inserts it with fetched=False, search_volume=None (due immediately)
-#     -> picked up on the very next poll pass (within
-#     KEYWORD_CHECK_INTERVAL_SECONDS).
-#
-#   - Keyword already fetched (fetched=True) -> get_due_keywords() will
-#     NEVER return it again, period. Zero DataForSEO SERP calls for it,
-#     ever again, even after restarts, even after any amount of time
-#     passes. This guarantees Claude/signals data is never disturbed by
-#     the same keyword search being repeated later.
-#
-#   - Keyword already has a search_volume stored -> it will NEVER be
-#     included in a future seed_search_volume_batch() call again either,
-#     for the exact same "fetch-once-forever" reason. NOTE: as of this
-#     build, search_volume is ALWAYS set after seeding (real value or
-#     random fallback — never left as None), so this remains true.
-#
-#   - Process restart -> sync_keywords_to_db() uses $setOnInsert, so it
-#     NEVER overwrites an existing keyword's fetched/timestamp/volume.
-#     Nothing resets to zero. Only genuinely brand-new keywords get
-#     inserted.
-#
-#   - v9.11.1: editing/replacing entries in the REDDIT_SEARCH_KEYWORDS
-#     python list -> has ZERO effect on any keyword already stored in
-#     flintel_keywords. get_due_keywords() and
-#     get_keywords_missing_volume() read flintel_keywords directly and
-#     do not filter by "is this keyword still in the current python
-#     list?" — so a keyword that's fetched=False (or missing
-#     search_volume) keeps getting picked up and processed exactly as
-#     before, even after it's been removed/swapped out of the python
-#     list. The python list is consulted ONLY by sync_keywords_to_db()
-#     to decide what brand-new keyword documents to insert.
+# APP + DB
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sync_keywords_to_db(keywords: list):
-    """
-    Ensures every keyword currently in REDDIT_SEARCH_KEYWORDS exists in
-    flintel_keywords. Brand-new keywords are inserted with fetched=False
-    and search_volume=None (both due immediately, real-time). Keywords
-    that already exist are left completely untouched — $setOnInsert only
-    writes on first-ever insert. Safe to call every loop pass and on
-    every restart.
+app = FastAPI(title="FLINTEL CRM Dashboard", version="1.0.0")
+templates = Jinja2Templates(directory="templates")
 
-    This is INSERT-ONLY and additive — it never deletes or hides a
-    keyword's existing document just because that keyword is no longer
-    present in `keywords`. (See get_due_keywords() /
-    get_keywords_missing_volume() below, which as of v9.11.1 no longer
-    filter their reads by this python list either, for the same reason.)
-    """
-    now = datetime.now(timezone.utc)
-    for kw in keywords:
-        try:
-            db.flintel_keywords.update_one(
-                {"keyword": kw},
-                {"$setOnInsert": {
-                    "keyword":                  kw,
-                    "fetched":                  False,
-                    "search_volume":            None,
-                    "search_volume_is_random":  False,
-                    "last_fetched_at":          None,
-                    "created_at":               now,
-                }},
-                upsert=True,
-            )
-        except Exception as exc:
-            log.error(f"[KEYWORD-CACHE] sync error for {kw!r}: {exc}")
-
-
-def get_keywords_missing_volume(keywords: list = None) -> list:
-    """
-    Returns keyword strings whose flintel_keywords document has no
-    search_volume stored yet (missing field or explicit None both match
-    this query — that's how a None-valued MongoDB filter works). These
-    are exactly the keywords that will be sent to
-    seed_search_volume_batch() next, batched, never one at a time.
-
-    v9.11.1 FIX: this query is now taken DIRECTLY against the full
-    flintel_keywords collection — it is NOT restricted to
-    "{'keyword': {'$in': keywords}}" anymore. Previously, a keyword that
-    still had search_volume=None in Mongo but had since been
-    removed/replaced in the REDDIT_SEARCH_KEYWORDS python list would
-    silently stop showing up here and never get seeded. Now, ANY
-    keyword in flintel_keywords still missing a search_volume is
-    returned, regardless of whether it's still present in the current
-    python list. The `keywords` parameter is kept (unused) purely so
-    every existing call site keeps working without any signature
-    changes elsewhere.
-
-    Once a keyword's search_volume is set (real value OR — as of this
-    build — a random fallback value when the real call failed), it will
-    never show up here again, so it will never be re-queried for volume,
-    ever — same fetch-once-forever guarantee as the discovery cache.
-    """
-    try:
-        cursor = db.flintel_keywords.find(
-            {"search_volume": None},
-            {"keyword": 1},
-        )
-        return [d["keyword"] for d in cursor]
-    except Exception as exc:
-        log.error(f"[VOLUME-SEED] get_keywords_missing_volume error: {exc}")
-        return []
-
-
-def get_due_keywords() -> list:
-    """
-    Returns keyword docs that have NEVER been fetched yet (fetched=False).
-    Once a keyword is marked fetched=True, it is PERMANENTLY excluded from
-    this query — there is no TTL, no re-due date, nothing. A keyword is
-    processed exactly once, ever. This guarantees Claude never re-scores
-    the same keyword's world twice and signals data is never disturbed
-    by repeat fetches.
-
-    v9.11.1 FIX: this query is now taken DIRECTLY against the full
-    flintel_keywords collection — it is NOT restricted to
-    "{'keyword': {'$in': REDDIT_SEARCH_KEYWORDS}}" anymore. Previously,
-    a keyword that was still fetched=False in Mongo (i.e. genuinely
-    never processed yet) would silently stop being picked up the moment
-    it was removed/replaced in the REDDIT_SEARCH_KEYWORDS python list —
-    even though nothing about its actual "has this been fetched?" state
-    had changed. Now, ANY keyword in flintel_keywords that's still
-    fetched=False is returned and processed, regardless of whether it's
-    still present in the current python list.
-
-    Each returned document already carries its own "search_volume" field
-    (seeded ahead of time by seed_search_volume_batch()) — the discovery
-    loop reads it straight off this same document, no extra query needed.
-    """
-    try:
-        cursor = db.flintel_keywords.find({"fetched": False})
-        return list(cursor)
-    except Exception as exc:
-        log.error(f"[KEYWORD-CACHE] get_due_keywords error: {exc}")
-        return []
-
-
-def mark_keyword_fetched(keyword: str):
-    """
-    Flips a keyword to fetched=True — PERMANENTLY. There is no TTL and no
-    next_due_at anymore: once true, this keyword will never be picked up
-    by get_due_keywords() again, even after restarts, even after 12h,
-    24h, or any amount of time. The only way to re-process a keyword is
-    to manually reset/delete its document in flintel_keywords.
-    """
-    now = datetime.now(timezone.utc)
-    try:
-        db.flintel_keywords.update_one(
-            {"keyword": keyword},
-            {"$set": {
-                "fetched":         True,
-                "last_fetched_at": now,
-            }},
-        )
-    except Exception as exc:
-        log.error(f"[KEYWORD-CACHE] mark_keyword_fetched error for {keyword!r}: {exc}")
-
+mongo_client = AsyncIOMotorClient(MONGODB_URI)
+db = mongo_client[MONGODB_DB]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEARCH-VOLUME BATCH SEEDING — chunks keywords, fetches volume for each
-# one (single.php only accepts one keyword per call), writes results back
-# onto each keyword's own flintel_keywords document.
-#
-# BUG 1 FIX (carried forward): when the provider's response doesn't
-# contain a recognizable volume field, the warning surfaces the HTTP
-# status code and, if the body is a dict, its "message" field. A body
-# shaped like {"message": "..."} is RapidAPI's own error envelope (bad
-# key, unsubscribed, rate-limited, quota exceeded, etc.) — NOT a data
-# payload with an unfamiliar field name.
-#
-# RANDOM-FALLBACK FIX (carried forward from v9.9): whenever that happens
-# — call failed, no usable field, non-JSON body, etc. — instead of
-# leaving search_volume as None forever, a random placeholder in the
-# SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is generated and stored,
-# and a clearly-labelled "RANDOM FALLBACK" warning is logged with the
-# exact value used. Real, provider-returned values are NEVER touched.
-# This failure is fully isolated to search_volume — it never blocks or
-# delays the separate Google-rank SERP call or the Reddit post fetch for
-# that keyword's discovered posts; those run independently regardless of
-# whether a real volume number or a random fallback came back.
+# IN-MEMORY LIVE STATE — seeded once from Mongo, then updated incrementally.
+# This is the ENTIRE reason the dashboard doesn't need to hammer Atlas.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
-    """
-    ONE-TIME (per keyword) BATCH search-volume seeding. Splits
-    `keywords_needing_volume` into chunks of up to `batch_size` and
-    fetches volume for every keyword in the chunk. Results are written
-    back onto each keyword's own flintel_keywords document
-    (search_volume field, plus search_volume_is_random) — the same
-    document already used for the fetch-once-forever discovery cache.
-    No new collection, no schema change beyond the one additive flag.
+live_stats: dict = {
+    p: {"count": 0, "high": 0, "medium": 0, "low": 0, "sum_score": 0, "avg_score": 0.0}
+    for p in PLATFORMS
+}
 
-    Once a keyword's search_volume is set here (real or random
-    fallback), get_keywords_missing_volume() will never return it again,
-    so this function will never be called for that keyword again —
-    fetch-once-forever, exactly like the SERP discovery cache above.
-    """
-    if not keywords_needing_volume:
-        return
-    if not RAPIDAPI_KEY:
-        log.warning(
-            "[VOLUME-SEED] RapidAPI key not set — cannot call the search-volume API. "
-            "Applying RANDOM FALLBACK values to all keywords in this pass so they are "
-            "never left permanently at None."
-        )
+# industry_stats — running tally of message COUNTS per industry (unchanged
+# from before), updated the same way live_stats is (seed once, then
+# incrementally via the same change stream on `signals`).
+industry_stats: dict = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
 
-    for i in range(0, len(keywords_needing_volume), batch_size):
-        chunk = keywords_needing_volume[i:i + batch_size]
-        try:
-            # single.php only accepts ONE keyword per request, so each
-            # keyword in the chunk gets its own call — same chunk/loop
-            # structure kept as-is, only the error visibility + random
-            # fallback behavior changed.
-            volume_map = {}
-            random_map = {}
+# NEW — industry_score_stats: a SEPARATE running tally of each industry's
+# own average intent_score (count / sum_score / avg_score). This is its
+# own independent number — it never overwrites or feeds into live_stats
+# (per-platform averages) or industry_stats (per-industry counts), and
+# vice versa. Seeded once at startup, then updated incrementally on insert
+# via the same change stream on `signals`.
+industry_score_stats: dict = {
+    key: {"count": 0, "sum_score": 0, "avg_score": 0.0} for key in INDUSTRY_KEYS_IN_ORDER
+}
 
-            for kw in chunk:
-                if not RAPIDAPI_KEY:
-                    vol = _random_search_volume_fallback()
-                    volume_map[kw] = vol
-                    random_map[kw] = True
-                    log.warning(
-                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
-                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: RAPIDAPI_KEY not "
-                        f"configured — call never made | this is NOT a real search volume."
-                    )
-                    continue
-
-                url = "https://seo-keyword-research.p.rapidapi.com/single.php"
-
-                querystring = {"keyword": kw, "country": "us"}
-
-                headers = {
-                    "x-rapidapi-key": RAPIDAPI_KEY, # .env
-                    "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
-                    "Content-Type": "application/json"
-                }
-
-                try:
-                    r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
-                    status_code = r.status_code
-                    try:
-                        row = r.json()
-                    except ValueError:
-                        log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{status_code}")
-                        row = None
-                except Exception as call_exc:
-                    log.error(f"[VOLUME-SEED] request error for {kw!r}: {call_exc}")
-                    status_code = None
-                    row = None
-
-                vol = _dig_value(row, VOLUME_FIELD_CANDIDATES)
-                if vol is None:
-                    # Surfaces the actual RapidAPI error instead of just
-                    # "field not found" — a {"message": ...} body means
-                    # the call itself failed (auth/quota/rate-limit),
-                    # not that the field name was wrong.
-                    api_message = row.get("message") if isinstance(row, dict) else None
-                    log.warning(
-                        f"[VOLUME-SEED] No search_volume for {kw!r} | status:{status_code} | "
-                        f"api_message:{api_message!r} | tried_fields:{VOLUME_FIELD_CANDIDATES} | "
-                        f"raw_keys:{list(row.keys()) if isinstance(row, dict) else type(row).__name__}"
-                    )
-                    vol = _random_search_volume_fallback()
-                    random_map[kw] = True
-                    log.warning(
-                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
-                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
-                        f"rate-limited / no usable field (see api_message above) | this is NOT "
-                        f"a real, provider-returned search volume."
-                    )
-                else:
-                    random_map[kw] = False
-                volume_map[kw] = vol
-
-            for kw in chunk:
-                vol = volume_map.get(kw)
-                is_random = random_map.get(kw, False)
-                db.flintel_keywords.update_one(
-                    {"keyword": kw},
-                    {"$set": {"search_volume": vol, "search_volume_is_random": is_random}},
-                    upsert=True,
-                )
-
-            random_count = sum(1 for v in random_map.values() if v)
-            log.info(
-                f"[VOLUME-SEED] Batch {i // batch_size + 1} | {len(chunk)} keyword(s) "
-                f"seeded with search_volume | via RapidAPI (single.php, one call per keyword) | "
-                f"real:{len(chunk) - random_count} random_fallback:{random_count}"
-            )
-
-        except Exception as exc:
-            log.error(f"[VOLUME-SEED] batch error (keywords {i}-{i + len(chunk)}): {exc}")
-            # Even on an unexpected batch-level error, don't leave these
-            # keywords permanently at None — apply the random fallback so
-            # they're never stuck, and log it clearly.
-            for kw in chunk:
-                vol = _random_search_volume_fallback()
-                log.warning(
-                    f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | search_volume={vol} "
-                    f"| reason: unexpected batch-level error — {exc} | this is NOT a real "
-                    f"search volume."
-                )
-                try:
-                    db.flintel_keywords.update_one(
-                        {"keyword": kw},
-                        {"$set": {"search_volume": vol, "search_volume_is_random": True}},
-                        upsert=True,
-                    )
-                except Exception as inner_exc:
-                    log.error(f"[VOLUME-SEED] could not persist random fallback for {kw!r}: {inner_exc}")
-
-        time.sleep(SERP_FETCH_SLEEP_SECONDS)
+connected_sockets: set = set()
+started_at = datetime.now(timezone.utc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_search_volume(search_keyword: str) -> int | None:
-    """
-    Monthly search volume — a SINGLE keyword, single request. Kept for
-    the Twitter fallback path (fetch_google_stats(), used only when
-    SEARCH_KEYWORD is configured for Twitter items, which have no
-    per-post SERP discovery in this design).
-
-    RANDOM-FALLBACK FIX (carried forward): if RAPIDAPI_KEY isn't
-    configured, the call fails/times out, the response isn't JSON, or no
-    usable volume field is found, a random placeholder in the
-    SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is returned instead of
-    None, and a clearly-labelled "RANDOM FALLBACK" warning is logged
-    with the exact value and reason. A real, provider-returned value is
-    NEVER overridden.
-
-    NOTE: the Reddit discovery path (process_one_keyword()) NO LONGER
-    calls this function — Reddit's search_volume now comes exclusively
-    from the batched seed_search_volume_batch() cache stored on each
-    keyword's flintel_keywords document. This function remains only for
-    the low-volume, single-keyword Twitter fallback use case.
-    """
-    if not search_keyword:
-        return None
-
-    if not RAPIDAPI_KEY:
-        vol = _random_search_volume_fallback()
-        log.warning(
-            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-            f"search_volume={vol} | reason: RAPIDAPI_KEY not configured — call never made | "
-            f"this is NOT a real search volume."
-        )
-        return vol
-
-    try:
-        url = "https://seo-keyword-research.p.rapidapi.com/single.php"
-
-        querystring = {"keyword": search_keyword, "country": "us"}
-
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env
-            "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
-            "Content-Type": "application/json"
-        }
-
-        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
-        status_code = r.status_code
-
-        try:
-            result = r.json()
-        except ValueError:
-            log.error(f"fetch_search_volume non-JSON response for {search_keyword!r} | status:{status_code}")
-            vol = _random_search_volume_fallback()
-            log.warning(
-                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-                f"search_volume={vol} | reason: non-JSON response (status:{status_code}) | "
-                f"this is NOT a real search volume."
-            )
-            return vol
-
-        vol = _dig_value(result, VOLUME_FIELD_CANDIDATES)
-        if vol is None:
-            api_message = result.get("message") if isinstance(result, dict) else None
-            log.warning(
-                f"fetch_search_volume no volume field for {search_keyword!r} | "
-                f"status:{status_code} | api_message:{api_message!r}"
-            )
-            vol = _random_search_volume_fallback()
-            log.warning(
-                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-                f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
-                f"rate-limited / no usable field (see api_message above) | this is NOT a "
-                f"real, provider-returned search volume."
-            )
-        return vol
-    except Exception as exc:
-        log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
-        vol = _random_search_volume_fallback()
-        log.warning(
-            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-            f"search_volume={vol} | reason: exception during call — {exc} | this is NOT a "
-            f"real search volume."
-        )
-        return vol
+def _bucket(score: int) -> str:
+    if score >= MIN_SCORE_HIGH:
+        return "high"
+    if score >= MIN_SCORE_MEDIUM:
+        return "medium"
+    return "low"
 
 
-def fetch_google_rank(search_keyword: str) -> int | None:
-    """
-    GENERIC (non-post-specific) Google rank fallback — used ONLY for
-    Twitter items, which have no per-post SERP discovery in this design.
-    Reflects the #1 organic result for the fixed SEARCH_KEYWORD.
-
-    This call is fully independent of fetch_search_volume() — it always
-    runs on its own merits and is never skipped or blocked just because
-    a prior search_volume lookup returned a random fallback or failed.
-    Google-rank has NO random-fallback behavior (only requested for
-    search_volume) — it stays None on failure, exactly as before.
-    """
-    if not RAPIDAPI_KEY or not search_keyword:
-        return None
-    try:
-        url = "https://google-search116.p.rapidapi.com/"
-
-        querystring = {"query": search_keyword}
-
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
-            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
-            "Content-Type": "application/json"
-        }
-
-        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
-
-        try:
-            result_data = r.json()
-        except ValueError:
-            log.error(f"fetch_google_rank non-JSON response for {search_keyword!r} | status:{r.status_code}")
-            return None
-
-        items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
-        if not items:
-            return None
-        return _dig_value(items[0], RANK_FIELD_CANDIDATES)
-    except Exception as exc:
-        log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
-        return None
+def _recalc_avg(platform: str):
+    cnt = live_stats[platform]["count"]
+    live_stats[platform]["avg_score"] = round(live_stats[platform]["sum_score"] / cnt, 2) if cnt else 0.0
 
 
-def fetch_google_stats(search_keyword: str) -> dict:
+def _recalc_industry_avg(key: str):
+    """NEW — recompute one industry's own average intent score."""
+    st = industry_score_stats[key]
+    st["avg_score"] = round(st["sum_score"] / st["count"], 2) if st["count"] else 0.0
+
+
+def _busiest_industry() -> dict:
+    """Which industry currently has the most messages (unchanged)."""
+    if not any(industry_stats.values()):
+        return {"key": None, "label": None, "count": 0}
+    best_key = max(industry_stats, key=lambda k: industry_stats[k])
     return {
-        "google_rank":   fetch_google_rank(search_keyword),
-        "search_volume": fetch_search_volume(search_keyword),
+        "key": best_key,
+        "label": INDUSTRY_LABELS[best_key],
+        "count": industry_stats[best_key],
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL -> Reddit's public,
-# credential-free per-post RSS feed (smart-retry) -> full post data (text,
-# username, subreddit, upvotes, comments, posted_at). Each keyword is
-# only fetched when get_due_keywords() says it's due — see the KEYWORD
-# CACHE section above. search_volume is read from the already-seeded
-# flintel_keywords document, never fetched here.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
-    """
-    RapidAPI Google search restricted to site:reddit.com, rolling
-    last-N-months date window. Returns real per-result rank + URL. Only
-    called for keywords that get_due_keywords() has flagged as due.
-
-    This call CANNOT be batched across keywords (each keyword is its own
-    unique search query with its own unique results) — it remains one
-    call per keyword. It runs unconditionally whenever a keyword is due,
-    on its own dedicated RapidAPI host, completely independent of the
-    search-volume host/call above — it is NEVER blocked, delayed, or
-    skipped because of a search-volume failure or random fallback, and
-    it never blocks search-volume in the other direction either.
-    """
-    if not RAPIDAPI_KEY:
-        log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
-        return []
-
-    today = datetime.now(timezone.utc)
-    date_from = today - timedelta(days=months_back * 30)
-    cd_min = date_from.strftime("%m/%d/%Y")
-    cd_max = today.strftime("%m/%d/%Y")
-
-    query = f'site:reddit.com "{keyword}"'
-    try:
-        url = "https://google-search116.p.rapidapi.com/"
-
-        querystring = {"query": query}
-
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
-            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
-            "Content-Type": "application/json"
-        }
-
-        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
-
-        try:
-            result_data = r.json()
-        except ValueError:
-            log.error(f"[SERP] Non-JSON response for {keyword!r} | status:{r.status_code}")
-            return []
-
-        raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
-        results = []
-        rank_misses = 0
-        for pos, item in enumerate(raw_items, start=1):
-            if not isinstance(item, dict):
-                continue
-            item_url = item.get("url", "") or item.get("link", "")
-            if "reddit.com" not in item_url:
-                continue
-            rank = _dig_value(item, RANK_FIELD_CANDIDATES)
-            if rank is None:
-                # Fall back to the result's position in the returned
-                # order if the provider genuinely doesn't expose an
-                # explicit rank field — better than a permanent null.
-                rank = pos
-                rank_misses += 1
-            results.append({
-                "url":   item_url,
-                "rank":  rank,
-                "title": item.get("title", ""),
-            })
-
-        if rank_misses and rank_misses == len(results) and results:
-            log.warning(
-                f"[SERP] '{keyword}' — no explicit rank field found in any result "
-                f"(tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
-            )
-
-        log.info(
-            f"[SERP] '{keyword}' → {len(results)} Reddit result(s) "
-            f"(last {months_back} months: {cd_min} to {cd_max})"
-        )
-        return results
-
-    except Exception as exc:
-        log.error(f"[SERP] RapidAPI search error for {keyword!r}: {exc}")
-        return []
-
-
-def is_post_already_signaled(post_url: str) -> bool:
-    """
-    Checks the `signals` collection DIRECTLY by post_url — BEFORE any
-    Reddit fetch or Claude scoring happens. If this URL was already
-    discovered and saved in a previous cycle (confirmed OR pending), we
-    skip it entirely here — no wasted fetch, no wasted Claude call.
-
-    This is a separate, independent safety net from the keyword-level
-    cache above: the keyword cache stops a keyword's SEARCH from
-    re-running too often; this dedup stops the SAME POST from being
-    re-scored even if its keyword search does run again.
-    """
-    if not post_url:
-        return False
-    try:
-        existing = db.signals.find_one({"post_url": post_url}, {"_id": 1})
-        return existing is not None
-    except Exception as exc:
-        log.error(f"[DEDUP] is_post_already_signaled error for {post_url}: {exc}")
-        return False   # fail-open: if the check itself fails, don't block discovery
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
-#
-# v9.11: switched from the .json endpoint to Reddit's public per-post
-# RSS feed (post_url + ".rss" instead of ".json"). Root cause of the
-# switch: the .json endpoint was hitting a consistent, 100%-failure-rate
-# 403 on BOTH www.reddit.com and old.reddit.com across every retry — the
-# signature of an IP-level anonymous-scraping block, not a code bug (the
-# SERP/Google-rank discovery call, on a totally separate RapidAPI host,
-# kept working the whole time). RSS is the SAME no-credentials-needed,
-# no-OAuth, no-PRAW philosophy — just a different Reddit URL suffix —
-# and is the same fetch style already proven at scale (10k+ messages)
-# elsewhere for this project. The v9.6 "smart" retry fetcher below
-# (proper User-Agent, jittered exponential backoff, old.reddit.com
-# fallback host) is completely unchanged — only the URL suffix (.rss
-# instead of .json) and the response parser (feedparser/XML instead of
-# JSON) are different. This fetch path is independent of the SERP/rank
-# call above and of search_volume seeding — none of the three block one
-# another.
-#
-# CAVEAT (schema limitation, not a bug): Reddit's RSS feed does not
-# include numeric upvote or comment counts. upvotes/comments are
-# therefore generated as a random placeholder (see
-# REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN/MAX above) for every post, with
-# a clearly-labelled "RANDOM FALLBACK" warning logged every single time
-# — exactly the same pattern already used for search_volume, so it is
-# always distinguishable in the logs from a real, provider-returned
-# number.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _reddit_get_with_retry(url: str) -> requests.Response | None:
-    """
-    v9.6 "smart" GET wrapper for Reddit's public endpoints — kept 100%
-    as-is in terms of retry/backoff/jitter behavior. As of v9.11 this is
-    used against the per-post RSS feed URL (post_url + ".rss") instead
-    of the .json endpoint, but the function itself is content-type
-    agnostic — it only inspects the HTTP status code, so no logic
-    change was needed here at all:
-      - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
-      - Small randomized jitter delay before each attempt, to avoid an
-        obviously robotic, perfectly-uniform request cadence.
-      - Exponential backoff retry, up to REDDIT_FETCH_MAX_RETRIES times,
-        specifically for 403 / 429 / 5xx responses (these are the
-        classes of error retrying can plausibly help with; a 404 means
-        the post is genuinely gone and is not retried).
-    Returns the Response on success (status 200), or None if every
-    attempt failed — caller treats None exactly like the old code
-    treated a raised exception (skip this post, try again on a future
-    discovery pass since it was never saved to `signals`).
-    """
-    headers = {
-        "User-Agent": REDDIT_USER_AGENT,
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-    }
-
-    last_status = None
-    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
-        # jitter delay BEFORE each request — including the first — so
-        # request timing doesn't look perfectly mechanical
-        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
-        try:
-            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
-            last_status = r.status_code
-            if r.status_code == 200:
-                return r
-            if r.status_code == 404:
-                # post genuinely removed/deleted — retrying won't help
-                log.debug(f"[SERP] 404 (gone) for {url} — not retrying.")
-                return None
-            if r.status_code in (403, 429) or r.status_code >= 500:
-                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
-                log.warning(
-                    f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
-                )
-                time.sleep(wait)
-                continue
-            # any other status — don't spin, just fail
-            log.error(f"[SERP] Unexpected status {r.status_code} for {url}")
-            return None
-        except requests.RequestException as exc:
-            log.warning(
-                f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                f"network error for {url}: {exc}"
-            )
-            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
-
-    log.error(f"[SERP] Reddit fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
-              f"(last_status:{last_status})")
-    return None
-
-
-def _extract_reddit_submission_id(post_url: str) -> str | None:
-    """Pulls the submission id out of a standard reddit.com post URL
-    (e.g. .../comments/<id>/...). Used to build a stable message_id
-    since the RSS feed itself doesn't always expose a clean numeric id.
-    Returns None if it can't be found — caller falls back to a
-    sanitized version of the full URL."""
-    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
-    return match.group(1) if match else None
-
-
-def _extract_reddit_subreddit_from_url(post_url: str) -> str:
-    """Pulls the subreddit name out of a standard reddit.com post URL
-    (e.g. reddit.com/r/<subreddit>/comments/...). Returns "" if it
-    can't be found — never raises."""
-    match = re.search(r"reddit\.com/r/([^/]+)/", post_url)
-    return match.group(1) if match else ""
-
-
-def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
-    """
-    Fetches the FULL post: text, username, subreddit, upvotes, comments,
-    posted_at. This is the ONLY way Reddit data enters this system now.
-
-    v9.11: fetches Reddit's public, credential-free per-post RSS feed
-    (post_url + ".rss") instead of the .json endpoint — no OAuth, no
-    PRAW, nothing to configure, same smart-retry + old.reddit.com
-    fallback host as before. title/selftext/author/subreddit/posted_at
-    come straight off the RSS entry. upvotes/comments are NOT present in
-    Reddit's RSS schema, so they are generated as a random placeholder
-    (REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN..MAX) with a clearly-labelled
-    "RANDOM FALLBACK" warning logged every time — same pattern already
-    used for search_volume.
-    """
-    if not post_url:
-        return None
-
-    primary_url = post_url.rstrip("/") + ".rss"
-    r = _reddit_get_with_retry(primary_url)
-
-    if r is None and "old.reddit.com" not in post_url:
-        # last-resort fallback host
-        fallback_url = (
-            post_url.rstrip("/")
-            .replace("https://www.reddit.com", "https://old.reddit.com")
-            .replace("https://reddit.com", "https://old.reddit.com")
-            + ".rss"
-        )
-        if fallback_url != primary_url:
-            log.info(f"[SERP] Retrying via old.reddit.com fallback: {fallback_url}")
-            r = _reddit_get_with_retry(fallback_url)
-
-    if r is None:
-        log.error(f"[SERP] fetch_reddit_post_by_url gave up for {post_url}")
-        return None
-
-    try:
-        feed = feedparser.parse(r.content)
-        if not feed.entries:
-            log.error(f"[SERP] fetch_reddit_post_by_url: RSS feed had no entries for {post_url}")
-            return None
-
-        entry = feed.entries[0]
-
-        title = (entry.get("title", "") or "").strip()
-        raw_summary = entry.get("summary", "") or ""
-        if not raw_summary and entry.get("content"):
-            raw_summary = entry["content"][0].get("value", "") or ""
-        summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
-
-        text = title
-        if summary_plain and summary_plain.lower() != title.lower():
-            text = f"{title}\n\n{summary_plain}"
-
-        author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
-        subreddit = _extract_reddit_subreddit_from_url(post_url)
-
-        posted_at = None
-        published = entry.get("published") or entry.get("updated")
-        if published:
-            try:
-                posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
-                                      tzinfo=timezone.utc).isoformat()
-            except (TypeError, ValueError):
-                posted_at = published  # fall back to raw string if struct_time parse fails
-
-        submission_id = _extract_reddit_submission_id(post_url)
-        message_id = f"reddit_serp_{submission_id}" if submission_id else (
-            f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
-        )
-
-        upvotes = _random_engagement_fallback()
-        comments = _random_engagement_fallback()
-        log.warning(
-            f"[SERP] RANDOM FALLBACK applied for engagement on {post_url} | "
-            f"upvotes={upvotes} comments={comments} "
-            f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
-            f"reason: Reddit's public RSS feed does not expose numeric engagement counts | "
-            f"this is NOT real, provider-returned engagement data."
-        )
-
-        return {
-            "message_id":           message_id,
-            "platform":             "reddit",
-            "text":                 text,
-            "username":             author,
-            "subreddit_or_channel": subreddit,
-            "post_url":             post_url,
-            "posted_at":            posted_at,
-            "search_keyword":       keyword,
-            "upvotes":              upvotes,
-            "comments":             comments,
-            "engagement_is_random": True,   # RSS never provides real counts — always random as of v9.11
-            "google_rank":          rank,   # real per-post rank, already set here
-            "search_volume":        None,   # filled in by process_one_keyword() below
-        }
-    except Exception as exc:
-        log.error(f"[SERP] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
-        return None
-
-
-def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) -> tuple:
-    """
-    Full discovery work for ONE keyword that get_due_keywords() has
-    flagged as due right now:
-      1. RapidAPI SERP search (site:reddit.com, last N months) — runs
-         regardless of whether this keyword's search_volume is a real
-         number or a random fallback.
-      2. Per-result post_url dedup check -> skip already-known posts
-         (no fetch, no Claude call for those)
-      3. Reddit fetch (public RSS feed, credential-free, smart-retry) for
-         genuinely new posts -> stamp the keyword's already-seeded
-         search_volume (and its random/real flag) onto each item ->
-         queue for Claude scoring
-    Returns (new_items_count, skipped_dupes_count) for logging.
-
-    `volume` and `volume_is_random` are passed in by the caller (read
-    straight off the keyword's own flintel_keywords document by
-    run_serp_discovery_loop()) instead of being fetched here —
-    search_volume is sourced from the batched seed_search_volume_batch()
-    cache. Every post discovered for this keyword still ends up with the
-    exact same item schema and the exact same queue/Claude/signals flow
-    — whether `volume` is real or a random fallback, the SERP rank
-    lookup and the Reddit post fetch above always still run.
-    """
-    new_items, skipped_dupes = 0, 0
-
-    results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
-
-    for result in results:
-        if is_post_already_signaled(result["url"]):
-            skipped_dupes += 1
-            log.debug(f"[SERP] Skipping already-known post_url: {result['url']}")
-            continue
-
-        item = fetch_reddit_post_by_url(result["url"], keyword, result["rank"])
-        if not item:
-            continue
-        item["search_volume"] = volume   # same cached value for every post from this keyword
-        item["search_volume_is_random"] = volume_is_random
-        reddit_queue.put(item)
-        save_queue_message("reddit", item)
-        new_items += 1
-        time.sleep(SERP_FETCH_SLEEP_SECONDS)
-
-    return new_items, skipped_dupes
-
-
-def run_serp_discovery_loop():
-    """
-    Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
-    for keywords that have NEVER been fetched (fetched=False), and for any
-    keyword still missing a cached search_volume (batch-seeds it — real
-    value, or a logged random fallback if the call fails/has no credits).
-
-    There is NO TTL, NO re-due date, NO fixed "sleep N hours then redo
-    everything" step. Each keyword's SERP discovery is processed exactly
-    ONCE, ever:
-      - a newly-added keyword is picked up on the very next pass
-        (within KEYWORD_CHECK_INTERVAL_SECONDS): its search_volume is
-        batch-seeded alongside any other keyword missing one at that
-        moment (never a solo per-keyword call), then it's processed one
-        at a time (sequential) for SERP + posts, then marked fetched=True
-        permanently.
-      - an already-fetched keyword is skipped forever, even immediately
-        after a full server restart — its state lives in MongoDB, not
-        in memory, so nothing resets to zero and nothing gets re-fetched.
-      - a keyword that already has a search_volume (real or random
-        fallback) is never re-queried for volume again, ever, for the
-        same reason.
-      - whether a keyword's seeded search_volume came back as a real
-        number OR a random fallback (RapidAPI error/quota/rate-limit —
-        see seed_search_volume_batch()), that keyword is STILL processed
-        for SERP rank + Reddit post fetch below exactly the same way — a
-        missing/failed volume never blocks or skips discovery, it is
-        simply replaced with a clearly-logged random placeholder.
-      - v9.11.1: "due" and "missing volume" are read straight off
-        flintel_keywords (via get_due_keywords() /
-        get_keywords_missing_volume()), with NO restriction to whatever
-        REDDIT_SEARCH_KEYWORDS currently contains. sync_keywords_to_db()
-        below still only ever INSERTS new keywords from the python list
-        (never overwrites/removes an existing doc) — so replacing an
-        entry in the python list does not erase or skip the old
-        keyword's still-pending state in Mongo.
-    """
-    sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
-
-    # One-time (per new keyword) BATCH search-volume seeding, done BEFORE
-    # the loop starts so the very first discovery pass already has cached
-    # volumes to read. Reads ALL of flintel_keywords still missing a
-    # volume — not just whatever's currently in REDDIT_SEARCH_KEYWORDS.
-    missing_volume = get_keywords_missing_volume()
-    if missing_volume:
-        log.info(
-            f"[VOLUME-SEED] {len(missing_volume)} keyword(s) need search_volume — "
-            f"seeding in batches of {SEARCH_VOLUME_BATCH_SIZE}..."
-        )
-        seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
-
-    log.info(
-        f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
-        f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
-        f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
-        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever, "
-        f"due/missing-volume read from flintel_keywords directly (not filtered by python list) | "
-        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
-        f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
-        f"on failure/no-credits (always logged) | "
-        f"REDDIT FETCH: public RSS feed only, credential-free ({REDDIT_FETCH_MAX_RETRIES}x backoff "
-        f"+ old.reddit.com fallback host, no OAuth/PRAW, random engagement fallback "
-        f"{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX})"
-    )
-
-    while True:
-        try:
-            # Pick up any newly-added keywords immediately (idempotent —
-            # never touches keywords that already exist).
-            sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
-
-            # Batch-seed search_volume for any keyword still missing one
-            # (covers brand-new keywords added since the last pass, or
-            # any keyword whose previous seed attempt somehow left it
-            # unset) — across ALL of flintel_keywords, not just the
-            # current python list.
-            missing_volume = get_keywords_missing_volume()
-            if missing_volume:
-                seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
-
-            due = get_due_keywords()
-            if not due:
-                time.sleep(KEYWORD_CHECK_INTERVAL_SECONDS)
-                continue
-
-            total_new, total_dupes = 0, 0
-            for doc in due:
-                keyword = doc["keyword"]
-                volume = doc.get("search_volume")                     # cached, already seeded — no API call
-                volume_is_random = doc.get("search_volume_is_random", False)
-                new_items, dupes = process_one_keyword(keyword, volume, volume_is_random)
-                mark_keyword_fetched(keyword)
-                total_new += new_items
-                total_dupes += dupes
-                sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
-                log.info(
-                    f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
-                    f"search_volume:{volume} ({sv_tag}, from cache) | "
-                    f"marked fetched=True PERMANENTLY — will never be re-fetched"
-                )
-                time.sleep(SERP_FETCH_SLEEP_SECONDS)
-
-            log.info(
-                f"[SERP] Pass complete | keywords_processed:{len(due)} | "
-                f"new_items:{total_new} | skipped_dupes:{total_dupes}"
-            )
-
-        except Exception as exc:
-            log.error(f"[SERP] discovery loop error: {exc}")
-            time.sleep(10)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_batch_prompt(batch: list) -> str:
-    lines = []
-    for i, item in enumerate(batch, start=1):
-        payload = {
-            "search_keyword": item.get("search_keyword", SEARCH_KEYWORD),
-            "text":           (item.get("text", "") or "")[:1200],
-            "platform":       item.get("platform", "unknown"),
-            "google_rank":    item.get("google_rank"),
-            "search_volume":  item.get("search_volume"),
-            "upvotes":        item.get("upvotes"),
-            "comments":       item.get("comments"),
-        }
-        lines.append(f"--- POST {i} ---\n{json.dumps(payload, ensure_ascii=False)}\n")
-    return "\n".join(lines)
-
-
-def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
-    return {
-        "index": index,
-        "intent_score": 1,
-        "is_relevant": False,
-        "reply_draft": None,
-        "_is_fallback": True,
-        "_fallback_reason": reason,
-    }
-
-
-def _strip_code_fences(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        return parts[1].lstrip("json").strip() if len(parts) > 1 else raw.strip("```").strip()
-    return raw
-
-
-def _salvage_partial_json_array(raw: str) -> list:
-    """Brace-depth-tracking salvage of a truncated JSON array."""
-    start = raw.find("[")
-    if start == -1:
-        return []
-    objects, depth, obj_start, in_string, escape = [], 0, None, False, False
-    i, n = start + 1, len(raw)
-    while i < n:
-        ch = raw[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            i += 1
-            continue
-        if ch == '"':
-            in_string = True
-            i += 1
-            continue
-        if ch == "{":
-            if depth == 0:
-                obj_start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and obj_start is not None:
-                candidate = raw[obj_start:i + 1]
-                try:
-                    objects.append(json.loads(candidate))
-                except (json.JSONDecodeError, ValueError):
-                    log.warning("[Claude-Batch] Skipped one malformed salvaged object.")
-                obj_start = None
-        i += 1
-    return objects
-
-
-def _parse_claude_json(raw: str) -> tuple:
-    cleaned = _strip_code_fences(raw)
-    try:
-        parsed = json.loads(cleaned)
-        if not isinstance(parsed, list):
-            raise ValueError("Claude returned non-list.")
-        return parsed, False
-    except (json.JSONDecodeError, ValueError) as exc:
-        log.warning(f"[Claude-Batch] Full parse failed ({exc}) — attempting partial recovery.")
-        return _salvage_partial_json_array(cleaned), True
-
-
-def _call_claude_batch(batch: list) -> list:
-    prompt = _build_batch_prompt(batch)
-    with anthropic_client.messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=MAX_TOKENS,
-        system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
-    ) as stream:
-        raw = stream.get_final_text().strip()
-
-    results, was_truncated = _parse_claude_json(raw)
-
-    if was_truncated:
-        recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
-        missing = sorted(set(range(1, len(batch) + 1)) - recovered)
-        log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
-                    f"recovered:{len(recovered)} | missing:{len(missing)}")
-        log_operator_alert(
-            title="Claude Response Truncated (max_tokens) — Partial Recovery",
-            detail=f"batch_size:{len(batch)} recovered:{len(recovered)} missing:{missing[:30]}",
-            level="ERROR",
-        )
-        for idx in missing:
-            results.append(_fallback_score(idx, "Truncated — not recovered."))
-
-    if not isinstance(results, list):
-        raise ValueError("Claude returned non-list after parsing.")
-
-    for r in results:
-        r.setdefault("is_relevant", False)
-        r.setdefault("reply_draft", None)
-        r.setdefault("_is_fallback", False)
-        if r.get("intent_score", 1) < 1:
-            r["intent_score"] = 1
-        if r.get("intent_score", 1) > 100:
-            r["intent_score"] = 100
-
+async def _aggregate_platform(platform: str = None) -> dict:
+    """Single aggregation, only run at startup (all platforms) or after an
+    UPDATE event on one platform (rescoring can change a score after
+    insert, so that one platform gets cheaply re-summed — never the whole
+    collection on a timer)."""
+    match_stage = {"$match": {"platform": platform}} if platform else {"$match": {}}
+    pipeline = [
+        match_stage,
+        {"$group": {
+            "_id": "$platform",
+            "count": {"$sum": 1},
+            "sum_score": {"$sum": "$intent_score"},
+            "high":   {"$sum": {"$cond": [{"$gte": ["$intent_score", MIN_SCORE_HIGH]}, 1, 0]}},
+            "medium": {"$sum": {"$cond": [{"$and": [
+                {"$gte": ["$intent_score", MIN_SCORE_MEDIUM]},
+                {"$lt":  ["$intent_score", MIN_SCORE_HIGH]},
+            ]}, 1, 0]}},
+            "low":    {"$sum": {"$cond": [{"$lt": ["$intent_score", MIN_SCORE_MEDIUM]}, 1, 0]}},
+        }},
+    ]
+    results = {}
+    async for row in db.signals.aggregate(pipeline):
+        results[row["_id"]] = row
     return results
 
 
-def score_batch_with_claude(batch: list) -> list:
-    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="Claude-Batch")
-    if result is None:
-        log_operator_alert(
-            title="Claude API Unavailable",
-            detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
-            level="CRITICAL",
-        )
-        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
-    return result
+async def seed_live_stats():
+    results = await _aggregate_platform(None)
+    for p in PLATFORMS:
+        row = results.get(p)
+        if not row:
+            continue
+        live_stats[p]["count"]     = row["count"]
+        live_stats[p]["sum_score"] = row["sum_score"]
+        live_stats[p]["high"]      = row["high"]
+        live_stats[p]["medium"]    = row["medium"]
+        live_stats[p]["low"]       = row["low"]
+        _recalc_avg(p)
+    log.info(f"Seeded live stats from MongoDB | { {k: v['count'] for k, v in live_stats.items()} }")
+
+
+async def seed_industry_stats():
+    """
+    Seed industry_stats (counts) AND industry_score_stats (own average
+    intent per industry) once at startup.
+
+    Unlike live_stats (which is a pure numeric aggregation MongoDB can do
+    server-side), industry classification depends on free-text content, so
+    this pulls only the small set of relevant fields per doc (platform +
+    the keyword/text candidate fields + intent_score) and classifies in
+    Python. This is a one-time full scan at startup — not run on a timer —
+    after which the change stream keeps both industry_stats and
+    industry_score_stats current incrementally, exactly like live_stats.
+    """
+    projection = {"platform": 1, "intent_score": 1}
+    for f in KEYWORD_FIELD_CANDIDATES + TEXT_FIELD_CANDIDATES:
+        projection[f] = 1
+
+    counts = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
+    score_totals = {key: 0 for key in INDUSTRY_KEYS_IN_ORDER}
+    other_breakdown.clear()
+    cursor = db.signals.find({}, projection)
+    async for doc in cursor:
+        industry, other_source = _classify_industry_with_source(doc)
+        counts[industry] = counts.get(industry, 0) + 1
+        score_totals[industry] = score_totals.get(industry, 0) + doc.get("intent_score", 0)
+        if industry == OTHER_INDUSTRY_KEY:
+            _record_other_breakdown(other_source)
+
+    industry_stats.update(counts)
+    for key in INDUSTRY_KEYS_IN_ORDER:
+        industry_score_stats[key]["count"] = counts.get(key, 0)
+        industry_score_stats[key]["sum_score"] = score_totals.get(key, 0)
+        _recalc_industry_avg(key)
+
+    log.info(f"Seeded industry stats from MongoDB | {industry_stats}")
+    log.info(f"Seeded industry average-intent stats from MongoDB | {industry_score_stats}")
+
+
+async def broadcast(payload: dict):
+    if not connected_sockets:
+        return
+    dead = set()
+    for ws in connected_sockets:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.add(ws)
+    connected_sockets.difference_update(dead)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE
+# CHANGE STREAM — the real-time heart of the dashboard.
+# Watches ONLY the `signals` collection, exactly as flintel.py writes it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_new_signal(item: dict, score_result: dict, force_pending: bool = False) -> bool:
-    """
-    Brand-new LIVE items (from Reddit SERP-discovery or Twitter).
-
-    status logic:
-      - force_pending=True  -> status="pending"   (Claude failed for this
-        item; run_rescore_processor() will automatically pick it up on
-        its next poll cycle and retry scoring, reusing the enrichment
-        fields already stored below — NO re-fetch from Reddit or
-        RapidAPI happens on rescore.)
-      - force_pending=False -> status="confirmed" (Claude scored it
-        successfully — final).
-
-    The `signals` document schema itself is UNCHANGED. The random/real
-    origin of search_volume is surfaced purely in the log line below
-    (via item.get("search_volume_is_random")) so it's always visible in
-    the application/render logs which value type was used, without
-    altering the persisted schema.
-    """
-    doc = {
-        "message_id":            item["message_id"],
-        "platform":               item.get("platform", "unknown"),
-        "post_url":               item.get("post_url", ""),
-        "text":                   item.get("text", ""),
-        "username":               item.get("username", "unknown"),
-        "subreddit_or_channel":   item.get("subreddit_or_channel", ""),
-        "posted_at":              item.get("posted_at"),
-        "fetched_at":             datetime.now(timezone.utc),
-        "google_rank":            item.get("google_rank"),
-        "search_volume":          item.get("search_volume"),
-        "upvotes":                item.get("upvotes"),
-        "comments":               item.get("comments"),
-        "search_keyword":         item.get("search_keyword", SEARCH_KEYWORD),
-        "intent_score":           score_result.get("intent_score", 1),
-        "is_relevant":            score_result.get("is_relevant", False),
-        "reply_draft":            score_result.get("reply_draft"),
-        "client_id":              CLIENT_ID,
-        "status":                 "pending" if force_pending else "confirmed",
-        "created_at":             datetime.now(timezone.utc),
-    }
-    try:
-        db.signals.insert_one(doc)
-        sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
-        eng_tag = "RANDOM-FALLBACK" if item.get("engagement_is_random") else "real"
-        # Minimal, focused log line — ONLY what's needed to eyeball a
-        # signal at a glance: platform + keyword, search_volume (/mo,
-        # tagged real vs random-fallback), upvotes/comments (tagged real
-        # vs random-fallback — as of v9.11, Reddit RSS never provides
-        # real counts, so this will always read RANDOM-FALLBACK for
-        # Reddit items), google_rank as a plain number, and the post_url.
-        # Full doc (score, etc.) is still in Mongo/the /signals endpoint
-        # as before — this is just the log line format, nothing else
-        # changed.
-        log.info(
-            f"SAVED [{doc['platform'].upper()}] {doc['search_keyword']!r} | "
-            f"search_volume:{doc['search_volume']}/mo ({sv_tag}) | "
-            f"upvotes:{doc['upvotes']} comments:{doc['comments']} ({eng_tag}) | "
-            f"google_rank:{doc['google_rank']} | "
-            f"post_url:{doc['post_url']}"
-        )
-        return True
-    except DuplicateKeyError:
-        # Post already exists in signals (message_id unique) — the last
-        # safety net. Claude may have just re-scored a re-discovered post
-        # (cost incurred), but it will not be stored twice.
-        return False
-    except Exception as exc:
-        log.error(f"MongoDB save error: {exc}")
-        log_operator_alert("MongoDB Write Failed", str(exc), level="CRITICAL")
-        return False
-
-
-def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: dict) -> bool:
-    """
-    Called by the rescore processor once Claude has (re-)scored a
-    pending document. Reuses the enrichment fields (google_rank,
-    search_volume, upvotes, comments) that are ALREADY stored on the
-    existing document — NO new fetch to Reddit or RapidAPI happens here,
-    only a re-call to Claude for scoring.
-    """
-    existing = db.signals.find_one({"message_id": message_id})
-    if not existing:
-        log.warning(f"[RESCORE] No existing doc for {message_id} — skipping.")
-        return False
-
-    new_doc = {
-        "message_id":            message_id,
-        "platform":               existing.get("platform", "unknown"),
-        "post_url":               existing.get("post_url", ""),
-        "text":                   existing.get("text", ""),
-        "username":               existing.get("username", "unknown"),
-        "subreddit_or_channel":   existing.get("subreddit_or_channel", ""),
-        "posted_at":              existing.get("posted_at") or existing.get("created_at"),
-        "fetched_at":             existing.get("fetched_at", datetime.now(timezone.utc)),
-        "google_rank":            enrichment.get("google_rank"),
-        "search_volume":          enrichment.get("search_volume"),
-        "upvotes":                enrichment.get("upvotes"),
-        "comments":               enrichment.get("comments"),
-        "search_keyword":         enrichment.get("search_keyword", SEARCH_KEYWORD),
-        "intent_score":           score_result.get("intent_score", 1),
-        "is_relevant":            score_result.get("is_relevant", False),
-        "reply_draft":            score_result.get("reply_draft"),
-        "client_id":              CLIENT_ID,
-        "status":                 "confirmed",
-        "created_at":             existing.get("created_at", datetime.now(timezone.utc)),
-    }
-    db.signals.replace_one({"message_id": message_id}, new_doc)
-    log.info(f"[RESCORE] CONFIRMED | {message_id} | score:{new_doc['intent_score']} relevant:{new_doc['is_relevant']}")
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — one instance per platform queue.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_batch_processor(
-    q: queue.Queue,
-    batch_size: int,
-    platform_label: str,
-    gap_seconds: int,
-    timeout_seconds: int,
-    keyword_filter_list: list,
-):
-    platform_key = platform_label.lower()
-
-    log.info(
-        f"Batch processor [{platform_label}] started | "
-        f"batch_size:{batch_size} | gap:{gap_seconds}s | timeout:{timeout_seconds}s"
-    )
-
-    current_batch, batch_start_time = load_pending_batch(platform_key)
-    if current_batch:
-        log.info(f"[{platform_label}] Resumed [{len(current_batch)}/{batch_size}] from persistent disk.")
-
-    total_received, total_matched, total_dropped, total_batches = 0, 0, 0, 0
-
+async def watch_signals():
     while True:
         try:
-            if current_batch and batch_start_time is not None:
-                wait_time = max(0.1, timeout_seconds - (time.time() - batch_start_time))
-            else:
-                wait_time = 1.0
+            async with db.signals.watch(
+                [{"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}}],
+                full_document="updateLookup",
+            ) as stream:
+                log.info("Change stream on `signals` opened — live updates active.")
+                async for change in stream:
+                    doc = change.get("fullDocument")
+                    if not doc:
+                        continue
+                    platform = doc.get("platform")
+                    if platform not in live_stats:
+                        continue
+                    score = doc.get("intent_score", 1)
+                    op = change["operationType"]
 
-            try:
-                item = q.get(timeout=wait_time)
-                got_item = True
-            except queue.Empty:
-                got_item = False
+                    if op == "insert":
+                        live_stats[platform]["count"]     += 1
+                        live_stats[platform]["sum_score"]  += score
+                        live_stats[platform][_bucket(score)] += 1
+                        _recalc_avg(platform)
 
-            if got_item:
-                total_received += 1
-                remove_queue_message(platform_key, item.get("message_id"))
+                        # Classify the new signal into an industry and bump
+                        # the running count tally the same way live_stats is.
+                        industry, other_source = _classify_industry_with_source(doc)
+                        industry_stats[industry] = industry_stats.get(industry, 0) + 1
+                        if industry == OTHER_INDUSTRY_KEY:
+                            _record_other_breakdown(other_source)
 
-                text = (item.get("text") or "").strip()
+                        # NEW — bump that industry's own average-intent tally.
+                        industry_score_stats[industry]["count"] += 1
+                        industry_score_stats[industry]["sum_score"] += score
+                        _recalc_industry_avg(industry)
 
-                if not text or len(text) < 10:
-                    q.task_done()
-                    continue
+                        event = {
+                            "platform": platform,
+                            "kind": "new_signal",
+                            "score": score,
+                            "industry": industry,
+                            "industry_label": INDUSTRY_LABELS[industry],
+                        }
+                    else:
+                        # rescore changed a score after the fact — re-sum
+                        # just this one platform (cheap, indexed) rather
+                        # than guessing which bucket to decrement.
+                        results = await _aggregate_platform(platform)
+                        row = results.get(platform)
+                        if row:
+                            live_stats[platform]["count"]     = row["count"]
+                            live_stats[platform]["sum_score"] = row["sum_score"]
+                            live_stats[platform]["high"]      = row["high"]
+                            live_stats[platform]["medium"]    = row["medium"]
+                            live_stats[platform]["low"]       = row["low"]
+                            _recalc_avg(platform)
+                        # NOTE: industry (and its average-intent tally) is not
+                        # recomputed here — a rescore changes intent_score,
+                        # not the post's text/keyword, so the industry bucket
+                        # a signal already landed in doesn't change.
+                        event = {"platform": platform, "kind": "rescored", "score": score}
 
-                if not passes_keyword_filter(text, keyword_filter_list):
-                    total_dropped += 1
-                    q.task_done()
-                    continue
-
-                total_matched += 1
-                if not current_batch:
-                    batch_start_time = time.time()
-
-                current_batch.append(item)
-                save_pending_batch(platform_key, current_batch, batch_start_time)
-                save_batch_seconds(platform_key, batch_start_time)
-
-                log.info(f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | u/{item.get('username')}")
-                q.task_done()
-
-            should_fire = False
-            fire_reason = ""
-            if len(current_batch) >= batch_size:
-                should_fire, fire_reason = True, f"batch full ({batch_size} items)"
-            elif current_batch and batch_start_time is not None:
-                elapsed = time.time() - batch_start_time
-                if elapsed >= timeout_seconds:
-                    should_fire, fire_reason = True, f"timeout ({timeout_seconds}s) — partial {len(current_batch)}/{batch_size}"
-
-            if should_fire and current_batch:
-                total_batches += 1
-                batch_to_send = current_batch[:batch_size]
-                current_batch = current_batch[batch_size:]
-                batch_start_time = None if not current_batch else time.time()
-
-                if current_batch:
-                    save_pending_batch(platform_key, current_batch, batch_start_time)
-                    save_batch_seconds(platform_key, batch_start_time)
-                else:
-                    clear_pending_batch(platform_key)
-                    clear_batch_seconds(platform_key)
-
-                # ── ENRICHMENT — real numbers, right before scoring ──────
-                google_stats = None
-                for it in batch_to_send:
-                    already_enriched = it.get("google_rank") is not None
-
-                    it.setdefault("upvotes", None)
-                    it.setdefault("comments", None)
-
-                    if not already_enriched and SEARCH_KEYWORD:
-                        if google_stats is None:
-                            google_stats = fetch_google_stats(SEARCH_KEYWORD)
-                        it["google_rank"] = google_stats.get("google_rank")
-                        it["search_volume"] = google_stats.get("search_volume")
-                        it["search_keyword"] = SEARCH_KEYWORD
-                        # search_volume for this path is produced by
-                        # fetch_search_volume(), which now always logs
-                        # its own "RANDOM FALLBACK" warning inline
-                        # whenever it had to synthesize a value instead
-                        # of returning a real one — no separate flag is
-                        # threaded through here to keep this enrichment
-                        # step's logic 100% as-is otherwise.
-
-                log.info(
-                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | reason:{fire_reason} | "
-                    f"items:{len(batch_to_send)} | received:{total_received} "
-                    f"matched:{total_matched} dropped:{total_dropped}"
-                )
-
-                scores = score_batch_with_claude(batch_to_send)
-                score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
-
-                for i, it in enumerate(batch_to_send):
-                    pos = i + 1
-                    sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch."))
-                    is_fallback = bool(sr.get("_is_fallback", False))
-                    save_new_signal(it, sr, force_pending=is_fallback)
-
-                log.info(f"[{platform_label}] BATCH {total_batches} COMPLETE — "
-                         f"{len(batch_to_send)} item(s) | waiting {gap_seconds}s...")
-                time.sleep(gap_seconds)
-
+                    await broadcast({
+                        "type": "stats",
+                        "data": live_stats,
+                        "event": event,
+                        "industries": industry_stats,
+                        "industry_avg_intent": industry_score_stats,   # NEW
+                        "busiest_industry": _busiest_industry(),
+                        "other_breakdown": _top_other_breakdown(),
+                    })
+        except PyMongoError as exc:
+            log.error(f"Change stream error: {exc} — reconnecting in 5s...")
+            await asyncio.sleep(5)
         except Exception as exc:
-            log.error(f"[{platform_label}] batch processor error: {exc}")
-            time.sleep(5)
+            log.error(f"watch_signals unexpected error: {exc} — reconnecting in 5s...")
+            await asyncio.sleep(5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — polls the `signals` collection DIRECTLY for
-# {"status": "pending"} documents (Claude-failure items).
+# LIGHT POLL — batch/queue/rescore state (tiny docs, not insert-only, so a
+# 5s poll is cheaper and simpler than a change stream here).
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_rescore_processor():
-    log.info(f"[RESCORE] Processor started | batch_size:{RESCORE_BATCH_SIZE} | "
-             f"poll:{RESCORE_POLL_INTERVAL}s | gap:{RESCORE_BATCH_GAP_SECONDS}s")
-    total_batches = 0
+async def get_queue_snapshot() -> dict:
+    snapshot = {}
+    for p in PLATFORMS:
+        pending_doc = await db.flintel_pending_batch.find_one({"platform": p})
+        pending_items = len(pending_doc.get("items", [])) if pending_doc else 0
+        batch_start   = pending_doc.get("batch_start_time") if pending_doc else None
 
+        backlog = await db.flintel_queue_messages.count_documents({"_platform_key": p})
+
+        elapsed = None
+        if batch_start:
+            bs = batch_start if batch_start.tzinfo else batch_start.replace(tzinfo=timezone.utc)
+            elapsed = round((datetime.now(timezone.utc) - bs).total_seconds(), 1)
+
+        cfg = BATCH_CONFIG[p]
+        snapshot[p] = {
+            "pending_in_batch": pending_items,
+            "batch_size":       cfg["batch_size"],
+            "timeout_seconds":  cfg["timeout"],
+            "elapsed_seconds":  elapsed,
+            "backlog_queue":    backlog,
+        }
+    return snapshot
+
+
+async def get_rescore_snapshot() -> dict:
+    pending    = await db.flintel_rescore_messages.count_documents({"status": "pending"})
+    processing = await db.flintel_rescore_messages.count_documents({"status": "processing"})
+    return {"pending": pending, "processing": processing}
+
+
+async def queue_poll_loop():
     while True:
         try:
-            pending = list(db.signals.find({"status": "pending"}).limit(RESCORE_BATCH_SIZE))
-            if not pending:
-                time.sleep(RESCORE_POLL_INTERVAL)
-                continue
-
-            items_for_claude = []
-            for doc in pending:
-                items_for_claude.append({
-                    "message_id":     doc["message_id"],
-                    "platform":       doc.get("platform", "unknown"),
-                    "text":           doc.get("text", ""),
-                    "search_keyword": doc.get("search_keyword", SEARCH_KEYWORD),
-                    "google_rank":    doc.get("google_rank"),
-                    "search_volume":  doc.get("search_volume"),
-                    "upvotes":        doc.get("upvotes"),
-                    "comments":       doc.get("comments"),
-                })
-
-            total_batches += 1
-            log.info(f"[RESCORE] BATCH {total_batches} | items:{len(items_for_claude)}")
-
-            scores = score_batch_with_claude(items_for_claude)
-            score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
-
-            for i, item in enumerate(items_for_claude):
-                pos = i + 1
-                sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos))
-                enrichment = {
-                    "google_rank":    item.get("google_rank"),
-                    "search_volume":  item.get("search_volume"),
-                    "upvotes":        item.get("upvotes"),
-                    "comments":       item.get("comments"),
-                    "search_keyword": item.get("search_keyword"),
-                }
-                # NOTE: even if this rescore attempt ALSO fails (still a
-                # fallback score), replace_confirmed_signal marks it
-                # "confirmed" — this prevents an infinite pending loop.
-                replace_confirmed_signal(item["message_id"], enrichment, sr)
-
-            log.info(f"[RESCORE] BATCH {total_batches} DONE — waiting {RESCORE_BATCH_GAP_SECONDS}s...")
-            time.sleep(RESCORE_BATCH_GAP_SECONDS)
-
+            queues  = await get_queue_snapshot()
+            rescore = await get_rescore_snapshot()
+            await broadcast({"type": "queues", "data": queues, "rescore": rescore})
         except Exception as exc:
-            log.error(f"[RESCORE] processor error: {exc}")
-            time.sleep(10)
+            log.error(f"queue_poll_loop error: {exc}")
+        await asyncio.sleep(5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER
+# NEW — helpers for the admin-only full-message-details endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_twitter_client() -> tweepy.Client | None:
-    if not TWITTER_BEARER_TOKEN:
-        log.warning("TWITTER_BEARER_TOKEN not set — Twitter platform disabled.")
-        return None
-    try:
-        client = tweepy.Client(
-            bearer_token=TWITTER_BEARER_TOKEN,
-            consumer_key=TWITTER_API_KEY,
-            consumer_secret=TWITTER_API_SECRET,
-            wait_on_rate_limit=True,
-        )
-        log.info("Twitter/X client initialised.")
-        return client
-    except Exception as exc:
-        log.error(f"Twitter client error: {exc}")
-        return None
+def _json_safe(value):
+    """Recursively convert Mongo-flavoured values (ObjectId, datetime) into
+    plain JSON-serializable types, leaving everything else untouched."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
-def poll_twitter(client: tweepy.Client):
-    seen_ids: set = load_seen_ids("twitter")
-    dirty = 0
-    log.info(f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)} | "
-             f"dedup resumed with {len(seen_ids)} ID(s)")
-
-    while True:
-        try:
-            response = client.search_recent_tweets(
-                query=TWITTER_SEARCH_QUERY,
-                max_results=50,
-                tweet_fields=["author_id", "created_at", "text", "public_metrics"],
-                expansions=["author_id"],
-                user_fields=["username", "name"],
-            )
-
-            if not response or not response.data:
-                time.sleep(TWITTER_POLL_INTERVAL)
-                continue
-
-            user_map = {u.id: u.username for u in (response.includes or {}).get("users", [])}
-
-            new_count = 0
-            for tweet in response.data:
-                tweet_id = str(tweet.id)
-                if tweet_id in seen_ids:
-                    continue
-                seen_ids.add(tweet_id)
-                dirty += 1
-                if len(seen_ids) > 50_000:
-                    seen_ids.clear()
-
-                username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
-                metrics = tweet.public_metrics or {}
-
-                _tw_item = {
-                    "message_id":           f"twitter_{tweet_id}",
-                    "platform":             "twitter",
-                    "text":                 tweet.text or "",
-                    "username":             username,
-                    "subreddit_or_channel": "",
-                    "post_url":             f"https://twitter.com/{username}/status/{tweet_id}",
-                    "posted_at":            str(tweet.created_at) if tweet.created_at else None,
-                    "search_keyword":       SEARCH_KEYWORD,
-                    "upvotes":              metrics.get("like_count"),
-                    "comments":             metrics.get("reply_count"),
-                    "google_rank":          None,
-                    "search_volume":        None,
-                }
-                twitter_queue.put(_tw_item)
-                save_queue_message("twitter", _tw_item)
-                new_count += 1
-
-            if dirty >= 10:
-                save_seen_ids("twitter", seen_ids)
-                dirty = 0
-
-            if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
-
-        except tweepy.errors.TweepyException as exc:
-            log.error(f"Twitter poll error: {exc}")
-        except Exception as exc:
-            log.error(f"Twitter unexpected error: {exc}")
-
-        time.sleep(TWITTER_POLL_INTERVAL)
+def _check_admin_password(password: str):
+    """Fails closed: if ADMIN_PASSWORD isn't set in .env, every request is
+    refused rather than silently allowed through."""
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="ADMIN_PASSWORD is not configured on the server (.env).")
+    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid admin password.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASYNC LISTENERS — thread management + auto-restart
+# STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def start_reddit_listener():
-    """
-    Reddit's ONLY mechanism now: SERP discovery thread (per-keyword
-    fetch-once-forever cache + batched search-volume seeding -> Google
-    search -> public, credential-free RSS fetch) + its dedicated batch
-    processor thread. Governed entirely by REDDIT_ENABLED + RapidAPI
-    credentials (RapidAPI is still required for SERP discovery itself;
-    the per-post fetch step needs no credentials at all — no OAuth/PRAW).
-    """
-    if not REDDIT_ENABLED:
-        log.warning("Reddit platform DISABLED — skipping.")
-        return
-    if not RAPIDAPI_KEY:
-        log.warning("Reddit not started — RAPIDAPI_KEY not set (required for SERP discovery).")
-        return
-
-    resumed = load_queue_messages("reddit")
-    for it in resumed:
-        reddit_queue.put(it)
-    if resumed:
-        log.info(f"[REDDIT] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
-
-    serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
-              REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
-        daemon=True, name="Reddit-Batch",
-    )
-    serp_thread.start()
-    btch_thread.start()
-    log.info(f"Reddit threads running: SERP-Discovery ✅ | Batch ✅ | "
-             f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s")
-
-    while True:
-        await asyncio.sleep(60)
-        if not serp_thread.is_alive():
-            log.error("Reddit SERP thread died — restarting...")
-            serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
-            serp_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Reddit batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
-                      REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
-                daemon=True, name="Reddit-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_twitter_listener():
-    if not TWITTER_ENABLED:
-        log.warning("Twitter platform DISABLED — skipping.")
-        return
-    client = build_twitter_client()
-    if client is None:
-        return
-
-    resumed = load_queue_messages("twitter")
-    for it in resumed:
-        twitter_queue.put(it)
-    if resumed:
-        log.info(f"[TWITTER] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
-
-    poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
-              TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
-        daemon=True, name="Twitter-Batch",
-    )
-    poll_thread.start()
-    btch_thread.start()
-    log.info(f"Twitter threads running: Poll ✅ | Batch ✅ | "
-             f"gap:{TWITTER_BATCH_GAP_SECONDS}s | timeout:{TWITTER_BATCH_TIMEOUT_SECONDS}s")
-
-    while True:
-        await asyncio.sleep(60)
-        if not poll_thread.is_alive():
-            log.error("Twitter poll thread died — restarting...")
-            poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
-            poll_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Twitter batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
-                      TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
-                daemon=True, name="Twitter-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_rescore_listener():
-    rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
-    rescore_thread.start()
-    log.info("Rescore processor thread running ✅")
-
-    while True:
-        await asyncio.sleep(60)
-        if not rescore_thread.is_alive():
-            log.error("Rescore processor thread died — restarting...")
-            rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
-            rescore_thread.start()
+@app.on_event("startup")
+async def on_startup():
+    await seed_live_stats()
+    await seed_industry_stats()
+    asyncio.create_task(watch_signals())
+    asyncio.create_task(queue_poll_loop())
+    log.info("FLINTEL CRM Dashboard ready — http://0.0.0.0:8100")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — read-only endpoints
+# ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="Flintel v9.11 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement) + Twitter Signal Scorer",
-    description=(
-        "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
-        "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
-        "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "Reddit per-post fetch uses ONLY Reddit's public, credential-free per-post RSS "
-        "endpoint (smart-retry + old.reddit.com fallback) — no OAuth, no PRAW, "
-        "nothing to configure. Search-volume ('search/mo') failures — bad key, "
-        "exhausted credits, rate-limits, timeouts, or no usable field — are "
-        "NEVER left as a permanent None: a random placeholder in a "
-        "configurable range (default 300-5000) is generated instead, and "
-        "every single occurrence is logged with a clearly-labelled "
-        "'RANDOM FALLBACK' warning naming the exact value + reason, so it's "
-        "always distinguishable in the logs from a real value. This is fully "
-        "independent of — and never blocks or is blocked by — the separate "
-        "Google-rank/SERP RapidAPI calls, which run on their own host and "
-        "their own try/except. Persistent batch state + queue + dedup — no "
-        "in-flight item is ever lost on restart. Each keyword is tracked in "
-        "flintel_keywords and, once fetched, is PERMANENTLY marked done — "
-        "restarts never reset progress and never trigger a re-fetch of an "
-        "already-done keyword. Which keywords are 'due' or 'missing volume' "
-        "is read directly from flintel_keywords, not filtered by whatever "
-        "the REDDIT_SEARCH_KEYWORDS python list currently contains — so "
-        "editing that list never causes an already-pending keyword to be "
-        "skipped or forgotten. Newly added keywords are picked up "
-        "automatically, one at a time. Streaming Claude with partial-JSON "
-        "recovery. Claude failures route to status='pending' for automatic "
-        "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
-        "RapidAPI) instead of a permanent low score."
-    ),
-    version="9.11.1",
-)
-
-
-def _serialise(signals: list) -> list:
-    for s in signals:
-        s.pop("_id", None)
-        for f in ["created_at", "fetched_at"]:
-            if s.get(f):
-                s[f] = s[f].isoformat()
-    return signals
-
 
 @app.get("/")
-def root():
-    now = datetime.now(timezone.utc)
-    total_keywords_tracked = db.flintel_keywords.count_documents({})
-    # v9.11.1: no longer restricted to "$in: REDDIT_SEARCH_KEYWORDS" —
-    # matches exactly what get_due_keywords() / get_keywords_missing_volume()
-    # will actually pick up, since those no longer filter by the python
-    # list either. A keyword removed from the python list but still
-    # pending in Mongo is still counted here.
-    due_now_count = db.flintel_keywords.count_documents({"fetched": False})
-    missing_volume_count = db.flintel_keywords.count_documents({"search_volume": None})
-    random_volume_count = db.flintel_keywords.count_documents({"search_volume_is_random": True})
-    return {
-        "status":                  "running",
-        "system":                  "FLINTEL v9.11.1 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement + Twitter)",
-        "client":                  CLIENT_ID,
-        "platforms":               ["reddit", "twitter"],
-        "reddit_enabled":          REDDIT_ENABLED,
-        "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW",
-        "twitter_enabled":         TWITTER_ENABLED,
-        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
-        "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
-        "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
-        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords), due/missing-volume read directly from Mongo (not filtered by the current python list)",
-        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
-        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
-        "reddit_fetch_reliability":         f"public RSS only, credential-free — smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
-        "reddit_engagement_random_fallback": f"ENABLED — range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (RSS has no real upvotes/comments), always logged",
-        "keywords_tracked":               total_keywords_tracked,
-        "keywords_due_now":               due_now_count,
-        "keywords_missing_search_volume": missing_volume_count,
-        "keywords_with_random_search_volume": random_volume_count,
-        "serp_months_back":        SERP_MONTHS_BACK,
-        "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
-        "reddit_batch_size":       REDDIT_BATCH_SIZE,
-        "twitter_batch_size":      TWITTER_BATCH_SIZE,
-        "rescore_batch_size":      RESCORE_BATCH_SIZE,
-        "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
-        "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
-        "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
-        "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
-        "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
-        "rapidapi_configured":    bool(RAPIDAPI_KEY),
-        "reddit_queue_size":       reddit_queue.qsize(),
-        "twitter_queue_size":      twitter_queue.qsize(),
-        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
-        "auth_required":           bool(API_KEY),
-        "telegram_removed":        True,
-        "reddit_rss_removed":      True,
-        "reddit_oauth_praw_removed": True,
-        "fixed_full_cycle_sleep_removed": True,
-        "post_url_dedup_before_scoring": True,
-        "claude_failure_routes_to_pending": True,
-        "keyword_due_state_independent_of_python_list": True,
-        "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
-    }
+async def dashboard(request: Request):
+    queues  = await get_queue_snapshot()
+    rescore = await get_rescore_snapshot()
+    return templates.TemplateResponse("crm.html", {
+        "request":          request,
+        "platforms":        PLATFORMS,
+        "platform_labels":  PLATFORM_LABELS,
+        "stats":            live_stats,
+        "queues":           queues,
+        "rescore":          rescore,
+        "mongodb_db":       MONGODB_DB,
+        "min_score_medium": MIN_SCORE_MEDIUM,
+        "min_score_high":   MIN_SCORE_HIGH,
+        # industry breakdown, passed through for the template to render
+        # (unchanged — same shape as before).
+        "industries":       industry_stats,
+        "industry_labels":  INDUSTRY_LABELS,
+        "busiest_industry": _busiest_industry(),
+        "other_breakdown":  _top_other_breakdown(),
+        # NEW — extra context, safe to ignore if crm.html doesn't use it yet.
+        "industry_avg_intent": industry_score_stats,
+    })
 
 
-@app.get("/health")
-def health():
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    await websocket.accept()
+    connected_sockets.add(websocket)
+    log.info(f"Dashboard client connected | total:{len(connected_sockets)}")
     try:
-        db.command("ping")
-        mongo = "connected"
+        await websocket.send_json({
+            "type": "stats",
+            "data": live_stats,
+            "industries": industry_stats,
+            "industry_avg_intent": industry_score_stats,   # NEW
+            "busiest_industry": _busiest_industry(),
+            "other_breakdown": _top_other_breakdown(),
+        })
+        queues  = await get_queue_snapshot()
+        rescore = await get_rescore_snapshot()
+        await websocket.send_json({"type": "queues", "data": queues, "rescore": rescore})
+        while True:
+            await websocket.receive_text()  # client keep-alive ping only
+    except WebSocketDisconnect:
+        pass
+    finally:
+        connected_sockets.discard(websocket)
+        log.info(f"Dashboard client disconnected | total:{len(connected_sockets)}")
+
+
+@app.get("/api/health")
+async def health():
+    try:
+        await db.command("ping")
+        mongo_ok = True
     except Exception:
-        mongo = "disconnected"
-
+        mongo_ok = False
     return {
-        "status":                  "ok",
-        "mongodb":                 mongo,
-        "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
-        "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free) — no OAuth/PRAW",
-        "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
-        "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "reddit_queue_size":       reddit_queue.qsize(),
-        "twitter_queue_size":      twitter_queue.qsize(),
-        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
-        "client_id":               CLIENT_ID,
-        "timestamp":               datetime.now(timezone.utc).isoformat(),
+        "status":         "ok" if mongo_ok else "degraded",
+        "mongodb":        "connected" if mongo_ok else "disconnected",
+        "mongodb_db":     MONGODB_DB,
+        "clients_live":   len(connected_sockets),
+        "uptime_seconds": round((datetime.now(timezone.utc) - started_at).total_seconds()),
     }
 
 
-@app.get("/keywords", dependencies=[Depends(verify_api_key)])
-def get_keywords_status():
+@app.get("/api/debug-industry-fields")
+async def debug_industry_fields():
     """
-    Inspect the fetch-once-forever keyword cache directly — for every
-    keyword shows whether it's been fetched (true = permanently done,
-    never re-fetched; false = still pending, due on the next pass), its
-    cached search_volume (real value or a random-fallback placeholder —
-    see search_volume_is_random), and when it was last fetched. Shows
-    EVERY keyword ever stored, including ones no longer present in the
-    current REDDIT_SEARCH_KEYWORDS python list.
+    Diagnostic endpoint. Everything landing in "Other" almost always means
+    the KEYWORD_FIELD_CANDIDATES / TEXT_FIELD_CANDIDATES field names don't
+    actually match your `signals` schema. This endpoint returns:
+      - every top-level field name found on a sample document
+      - out of a 500-doc sample, how many docs actually have a non-empty
+        value for each candidate field we're currently checking
+
+    Hit this, look at `sample_document_fields` for the real field name
+    that holds your post text (or the search keyword), then set
+    INDUSTRY_TEXT_FIELDS / INDUSTRY_KEYWORD_FIELDS in your .env to match.
     """
-    raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
-    due_count = 0
-    missing_volume_count = 0
-    random_volume_count = 0
-    docs = []
-    for d in raw_docs:
-        is_due = not d.get("fetched")
-        if is_due:
-            due_count += 1
-        if d.get("search_volume") is None:
-            missing_volume_count += 1
-        if d.get("search_volume_is_random"):
-            random_volume_count += 1
-        for f in ["last_fetched_at", "created_at"]:
-            if d.get(f):
-                d[f] = d[f].isoformat()
-        d["due_now"] = is_due
-        docs.append(d)
+    sample_doc = await db.signals.find_one({})
+    sample_fields = sorted(sample_doc.keys()) if sample_doc else []
+
+    sample_cursor = db.signals.find({}).limit(500)
+    checked = 0
+    field_presence = {f: 0 for f in (KEYWORD_FIELD_CANDIDATES + TEXT_FIELD_CANDIDATES)}
+    example_values = {}
+
+    async for doc in sample_cursor:
+        checked += 1
+        for f in field_presence:
+            val = doc.get(f)
+            if val is not None and str(val).strip():
+                field_presence[f] += 1
+                if f not in example_values:
+                    example_values[f] = str(val)[:120]
+
     return {
-        "total": len(docs),
-        "due_now": due_count,
-        "missing_search_volume": missing_volume_count,
-        "random_fallback_search_volume": random_volume_count,
-        "keywords": docs,
+        "sample_document_fields": sample_fields,
+        "sample_document_preview": {
+            k: (str(v)[:120] if not isinstance(v, (int, float, bool)) else v)
+            for k, v in (sample_doc or {}).items()
+        },
+        "checked_docs": checked,
+        "keyword_field_candidates": KEYWORD_FIELD_CANDIDATES,
+        "text_field_candidates": TEXT_FIELD_CANDIDATES,
+        "field_presence_count": field_presence,
+        "example_values_found": example_values,
+        "hint": (
+            "If field_presence_count is 0 for every candidate, none of "
+            "our guessed field names exist on your docs. Check "
+            "sample_document_fields for the real name of the field that "
+            "holds post text (and/or the search keyword), then set "
+            "INDUSTRY_TEXT_FIELDS / INDUSTRY_KEYWORD_FIELDS in .env, e.g. "
+            "INDUSTRY_TEXT_FIELDS=raw_message,body_text"
+        ),
     }
 
 
-@app.get("/signals", dependencies=[Depends(verify_api_key)])
-def get_signals(limit: int = 50, min_score: int = None, is_relevant: bool = None,
-                 platform: str = None, status: str = None):
-    q: dict = {"client_id": CLIENT_ID}
-    if min_score is not None:
-        q["intent_score"] = {"$gte": min_score}
-    if is_relevant is not None:
-        q["is_relevant"] = is_relevant
+@app.get("/api/industries")
+async def api_industries():
+    """
+    Standalone endpoint for the industry breakdown, in case the dashboard
+    template isn't updated yet to render it. Returns per-industry message
+    counts plus which industry currently has the most messages.
+
+    NEW: each entry also now includes that industry's own average
+    intent_score (avg_intent) — a separate number from the per-platform
+    averages shown elsewhere, and separate from the plain message count.
+    This part is NOT password-protected (it's aggregate numbers only, no
+    raw message content) — see /api/admin/messages for the full-JSON,
+    password-gated version.
+    """
+    return {
+        "industries": [
+            {
+                "key": key,
+                "label": INDUSTRY_LABELS[key],
+                "count": industry_stats.get(key, 0),
+                "avg_intent": industry_score_stats.get(key, {}).get("avg_score", 0.0),  # NEW
+            }
+            for key in INDUSTRY_KEYS_IN_ORDER
+        ],
+        "busiest_industry": _busiest_industry(),
+        "other_breakdown": _top_other_breakdown(),
+        "classification": {
+            "keyword_field_candidates": KEYWORD_FIELD_CANDIDATES,
+            "text_field_candidates": TEXT_FIELD_CANDIDATES,
+        },
+    }
+
+
+@app.get("/api/admin/messages")
+async def admin_messages(
+    password: str,
+    platform: str = None,
+    industry: str = None,
+    limit: int = 200,
+):
+    """
+    NEW — ADMIN-ONLY endpoint, gated behind ADMIN_PASSWORD (set in .env).
+    Meant to power a "Details" button in the dashboard: the button first
+    asks the person for the admin password, then calls this endpoint,
+    which returns full raw signal documents (not just aggregated counts)
+    as JSON — each one annotated with the industry it was classified into.
+
+    Example: every Reddit message classified as Fintech & Payments ->
+        /api/admin/messages?password=...&platform=reddit&industry=fintech_payments
+
+    Query params:
+      password  (required) — must match ADMIN_PASSWORD from .env
+      platform  (optional) — filter to one platform (reddit, twitter, ...)
+      industry  (optional) — filter to one industry key (fintech_payments,
+                              cybersecurity, ..., or "other")
+      limit     (optional, default 200, max 2000) — max messages returned
+
+    Since industry classification is computed on the fly (not stored on
+    the document), filtering by industry scans a wider window of recent
+    documents (still bounded) and classifies each one in Python until
+    `limit` matches are found or the scan window is exhausted.
+    """
+    _check_admin_password(password)
+
+    if platform and platform not in PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Unknown platform '{platform}'. Valid: {PLATFORMS}")
+    if industry and industry not in INDUSTRY_KEYS_IN_ORDER:
+        raise HTTPException(status_code=400, detail=f"Unknown industry '{industry}'. Valid: {INDUSTRY_KEYS_IN_ORDER}")
+
+    limit = max(1, min(limit, 2000))
+    scan_cap = max(limit * 25, 3000)
+
+    query = {}
     if platform:
-        q["platform"] = platform
-    if status:
-        q["status"] = status
-    signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-    return {"count": len(signals), "signals": _serialise(signals)}
+        query["platform"] = platform
 
+    matched = []
+    scanned = 0
+    cursor = db.signals.find(query).sort("_id", -1).limit(scan_cap)
+    async for doc in cursor:
+        scanned += 1
+        doc_industry = classify_industry(doc)
+        if industry and doc_industry != industry:
+            continue
+        safe_doc = _json_safe(doc)
+        safe_doc["_classified_industry"] = doc_industry
+        safe_doc["_classified_industry_label"] = INDUSTRY_LABELS[doc_industry]
+        matched.append(safe_doc)
+        if len(matched) >= limit:
+            break
 
-@app.get("/signals/relevant", dependencies=[Depends(verify_api_key)])
-def get_relevant_signals(limit: int = 50, min_score: int = 0):
-    signals = list(
-        db.signals.find(
-            {"client_id": CLIENT_ID, "is_relevant": True, "intent_score": {"$gte": min_score}},
-            {"_id": 0},
-        ).sort("intent_score", -1).limit(limit)
-    )
-    return {"count": len(signals), "signals": _serialise(signals)}
-
-
-@app.get("/signals/pending", dependencies=[Depends(verify_api_key)])
-def get_pending(limit: int = 100):
-    signals = list(db.signals.find({"status": "pending"}, {"_id": 0}).limit(limit))
-    return {"count": len(signals), "signals": _serialise(signals)}
-
-
-def run_fastapi():
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def main():
-    api_thread = threading.Thread(target=run_fastapi, daemon=True, name="FastAPI")
-    api_thread.start()
-    log.info("FastAPI running at http://0.0.0.0:8000")
-
-    await asyncio.gather(
-        start_reddit_listener(),
-        start_twitter_listener(),
-        start_rescore_listener(),
-    )
+    return {
+        "count": len(matched),
+        "scanned": scanned,
+        "filters": {"platform": platform, "industry": industry, "limit": limit},
+        "messages": matched,
+    }
 
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.11.1 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
-    log.info("                   + BATCHED SEARCH-VOLUME SEEDING + CREDENTIAL-FREE")
-    log.info("                   RSS FETCH + RANDOM-FALLBACK VOLUME/ENGAGEMENT")
-    log.info("                   + KEYWORD-CACHE READS INDEPENDENT OF PYTHON LIST) + TWITTER SIGNAL SCORER")
+    log.info("  FLINTEL CRM DASHBOARD — read-only, real-time, same MongoDB")
+    log.info(f"  DB: {MONGODB_DB} | Platforms: {', '.join(PLATFORMS)}")
     log.info("=" * 70)
-    log.info(f"  Client               : {CLIENT_ID}")
-    log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
-    log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
-    log.info(f"  Reddit fetch method  : public per-post RSS only — credential-free, no OAuth/PRAW, nothing to configure")
-    log.info(f"  Reddit engagement    : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
-    log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
-    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery + to seed brand-new flintel_keywords docs)")
-    log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
-    log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
-             f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD}")
-    log.info(f"  Keyword due state    : read directly from flintel_keywords — NOT filtered by the current "
-             f"REDDIT_SEARCH_KEYWORDS python list, so editing that list never hides an already-pending keyword")
-    log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | "
-             f"cached on flintel_keywords, read at discovery time | error status+message logged; "
-             f"never blocks rank/reddit fetch")
-    log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-             f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged, "
-             f"never overrides a real value")
-    log.info(f"  Reddit fetch         : public RSS smart-retry only ({REDDIT_FETCH_MAX_RETRIES}x backoff, "
-             f"jitter {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, old.reddit.com fallback) — "
-             f"no OAuth/PRAW")
-    log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
-    log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore source       : signals collection, status='pending' — never re-fetches, only re-scores")
-    log.info(f"  Claude streaming     : True | prompt: generic 1-100 relevance/visibility/engagement")
-    log.info(f"  RapidAPI config      : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume)")
-    log.info(f"  Telegram             : REMOVED")
-    log.info(f"  Reddit RSS           : REMOVED")
-    log.info(f"  Reddit OAuth/PRAW    : REMOVED")
-    log.info(f"  Fixed full-cycle sleep: REMOVED (each keyword has its own independent fetch-once-forever state)")
-    log.info(f"  MongoDB DB           : {MONGODB_DB}")
-    log.info(f"  API auth             : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
-    log.info("=" * 70)
-
-    asyncio.run(main())
+    uvicorn.run(app, host="0.0.0.0", port=8100, log_level="warning")
