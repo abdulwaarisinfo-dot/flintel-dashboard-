@@ -217,8 +217,8 @@ INDUSTRIES = {
     "better than stripe", "cheaper than stripe", "instead of stripe", "wire failed", "compliance review", "compliance check",
 
     # ── OTHER PROCESSOR/PSP PAIN (generalized, not per-platform spam) ───────
-    "PayPal froze my funds", "PayPal held my funds", "PayPal banned my account",
-    "PayPal high fees", "PayPal chargeback problems", "PayPal terrible support", "transfer taking forever",
+    "PayPal froze my funds", "PayPal held my funds", "PayPal banned my account", "how do I send", "tried so many", "nothing works", "what are you using",
+    "PayPal high fees", "PayPal chargeback problems", "PayPal terrible support", "transfer taking forever", "looking for a solution",
             "days to process", "losing money on fees", "highway robbery",
     "Square froze my funds", "Square held my funds", "Square account closed",
     "Adyen froze my funds", "Checkout.com froze my funds",
