@@ -204,7 +204,7 @@ INDUSTRIES = {
             "reconciliation", "chargeback", "payment fraud", "fintech", "fintech startup", "hidden fees", "unexpected fees",
             "fintech platform", "money held", "won't release my funds", "money hostage",
              "stripe froze my funds", "stripe held my funds", "stripe holding my funds", "bank rejected my",
-    "stripe banned my account", "stripe suspended my account",
+    "stripe banned my account", "stripe suspended my account", "better than Wise", "anyone recommend",
     "stripe account closed", "stripe account frozen", "stripe rejected my business",
     "stripe withheld my payout", "stripe payout delayed", "FX fees", "unexpected charges",
     "stripe high fees", "stripe hidden fees", "why is stripe so expensive",
@@ -741,6 +741,9 @@ INDUSTRIES = {
     "just hired our first salesperson", "scaling our sales operations",
     "new sales hire needs a CRM", "board wants better reporting",
     "investors asking about pipeline", "need better reporting for investors",
+    "setting up email campaigns and abandoned cart sequences is tedious and I'm not sure what angle works",
+    "70% of my buyers decide before talking to sales, but I'm invisible on the channels they actually search",
+    "My competitor posts every day and outranks me on Google; I can't keep up manually"
 
     # ── JOB SIGNALS ────────────────────────────────────────────────────────────
     "VP of sales", "head of sales", "sales operations manager",
@@ -1184,6 +1187,7 @@ INDUSTRIES = {
     "who uses", "what are you using for accounting",
     "tried several accounting tools", "still looking for accounting software",
     "still haven't found the right accounting software",
+    "writing ad copy that actually converts takes forever or I pay freelancers who are slow",
 
     # ── ACCOUNTING TOOLS & CATEGORIES ────────────────────────────────────────
     "invoicing software", "expense tracking software", "expense management tool",
