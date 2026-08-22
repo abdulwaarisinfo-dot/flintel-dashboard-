@@ -345,7 +345,7 @@ INDUSTRIES = {
     "no dedicated finance person", "growing business need better accounting",
     "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
     "virtual CFO", "fractional CFO", "need a fractional CFO",
-    "part time bookkeeper", "part time accountant",
+    "part time bookkeeper", "part time accountant", "CFO"
 
       "urgently need a bookkeeper", "need books cleaned up ASAP",
     "tax deadline approaching", "need this done before tax season",
