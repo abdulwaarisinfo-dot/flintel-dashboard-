@@ -391,20 +391,7 @@ INDUSTRIES = {
     "need incident response",
     "Salesforce alternative",
     "switching from HubSpot",
-    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
-      "urgently need a bookkeeper", "need books cleaned up ASAP",
-    "tax deadline approaching", "need this done before tax season",
-    "investors asking for financials", "due diligence deadline",
-    "board wants updated financials", "need financials for loan application",
-    "need financials for a loan", "applying for a business loan financials",
 
-      "head of talent", "head of HR", "head of people",
-    "VP of people", "VP of talent", "chief people officer",
-    "talent acquisition manager", "recruiting manager",
-    "HR manager", "HR business partner", "people operations manager",
-    "HRIS manager", "compensation and benefits manager",
-    "director of talent acquisition", "director of people operations",
-    "technical recruiter", "corporate recruiter", "recruiting coordinator",
 
       "send money to", "sending money to", "transfer money to",
     "transferring money to", "wire money to", "wiring money to",
@@ -923,6 +910,17 @@ INDUSTRIES = {
             "interview scheduling", "background check", "career site", "linkedin recruiter",
             "indeed job", "ziprecruiter", "bamboohr", "gusto payroll", "rippling",
             "ashby ats", "smartrecruiters", "greenhouse", "lever ats", "workday hr",
+
+                "head of talent",
+                "head of HR",
+                "chief people officer",
+                "talent acquisition manager",
+                "recruiting manager",
+                "HR manager",
+                "HR business partner",
+                "HRIS manager",
+                "technical recruiter",
+                "corporate recruiter",
             
             # ── HIRING / RECRUITING PAIN POINTS ──────────────────────────────────────
     "hiring is a nightmare", "recruiting is a nightmare",
@@ -1088,6 +1086,15 @@ INDUSTRIES = {
             "erp accounting", "netsuite", "sage accounting", "zoho books", "wave accounting",
             "wave app", "bill.com", "expensify", "receipt scanning", "reconciliation software",
             "cfo tools", "payroll accounting", "freshbooks",
+
+                "urgently need a bookkeeper",
+                "need books cleaned up ASAP",
+                "tax deadline approaching",
+                "investors asking for financials",
+                "due diligence deadline",
+                "board wants updated financials",
+                "need financials for loan application",
+                "applying for a business loan financials",
 
             # job-title / role signals — someone hiring for or working as one of these is
             # an accounting-software-relevant signal even without the software name itself
