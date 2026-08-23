@@ -621,7 +621,7 @@ INDUSTRIES = {
     "duplicate leads CRM", "CRM data quality issues",
     "no one updates the CRM", "reps don't update the CRM",
     "sales team hates the CRM", "sales team won't use the CRM",
-    "low CRM adoption", "poor CRM adoption", "CRM adoption problem",
+    "low CRM adoption", "poor CRM adoption", "CRM adoption problem", "Semrush / Ahrefs",
     "manual data entry CRM", "too much manual data entry",
     "spreadsheets instead of CRM", "still using spreadsheets for sales",
     "tracking leads in spreadsheets", "tracking deals in spreadsheets",
