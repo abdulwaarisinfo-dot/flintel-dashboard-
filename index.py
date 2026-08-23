@@ -187,7 +187,7 @@ INDUSTRIES = {
         "keywords": [
             
               "cross-border", "cross border", "cross border payment", "cross-border payments", "bank froze my", "transaction blocked", "£15k", "£15,000",
-            "payment", "payments", "payment gateway", "payment processor", "payment processing", "transfer pending",
+            "payment", "payments", "payment gateway", "payment processor", "payment processing", "transfer pending", "£10k", "£10,000",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",  
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate", "transfer failed",
             "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer", "looking for a transfer",
