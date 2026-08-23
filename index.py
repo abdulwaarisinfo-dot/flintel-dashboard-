@@ -392,15 +392,6 @@ INDUSTRIES = {
     "Salesforce alternative",
     "switching from HubSpot",
     # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
-    "my bookkeeper", "our bookkeeper", "my accountant", "our accountant",
-    "small business accounting", "startup accounting", "solo founder accounting",
-    "freelancer accounting", "self employed accounting", "DIY bookkeeping",
-    "doing my own books", "founder doing the books", "wearing the finance hat",
-    "no dedicated finance person", "growing business need better accounting",
-    "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
-    "virtual CFO", "fractional CFO", "need a fractional CFO",
-    "part time bookkeeper", "part time accountant", "CFO"
-
       "urgently need a bookkeeper", "need books cleaned up ASAP",
     "tax deadline approaching", "need this done before tax season",
     "investors asking for financials", "due diligence deadline",
@@ -1097,6 +1088,7 @@ INDUSTRIES = {
             "erp accounting", "netsuite", "sage accounting", "zoho books", "wave accounting",
             "wave app", "bill.com", "expensify", "receipt scanning", "reconciliation software",
             "cfo tools", "payroll accounting", "freshbooks",
+
             # job-title / role signals — someone hiring for or working as one of these is
             # an accounting-software-relevant signal even without the software name itself
             "accountant", "staff accountant", "senior accountant", "junior accountant",
