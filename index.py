@@ -191,7 +191,7 @@ INDUSTRIES = {
             "payment infrastructure", "payment platform", "payment provider", "payment rails",  "500 thousand", "$500,000",
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate", "transfer failed", "one million", "$1m",
             "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer", "looking for a transfer", "$1 million",
-            "iban", "swift", "stripe", "paypal", "wise transfer", "revolut", "adyen", "plaid",
+            "iban", "swift", "stripe", "paypal", "wise transfer", "revolut", "adyen", "plaid", "$250k",
             "square payments", "venmo", "cash app", "zelle", "banking", "bank transfer", "transfer stuck", "$750k",
             "online banking", "digital bank", "neobank", "challenger bank", "open banking",
             "embedded finance", "currency exchange", "money transfer", "international payments",
