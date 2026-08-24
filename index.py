@@ -197,7 +197,7 @@ INDUSTRIES = {
             "embedded finance", "currency exchange", "money transfer", "international payments",
             "b2b payments", "merchant account", "card processing", "checkout flow",
             "billing platform", "subscription billing", "recurring billing", "invoice payments",
-            "buy now pay later", "bnpl", "digital wallet", "e-wallet", "mobile wallet", "charging too much",
+            "buy now pay later", "bnpl", "digital wallet", "e-wallet", "mobile wallet", "charging too much", "$750,000",
             "kyc", "aml compliance", "correspondent banking", "treasury management",
             "currency conversion", "exchange rate", "money transmitter", "payfac",
             "acquiring bank", "issuing bank", "virtual card", "prepaid card", "settlement",
