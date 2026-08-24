@@ -222,7 +222,7 @@ INDUSTRIES = {
             "days to process", "losing money on fees", "highway robbery",
     "Square froze my funds", "Square held my funds", "Square account closed",
     "Adyen froze my funds", "Checkout.com froze my funds",
-    "Wise froze my funds", "Wise account closed", "Revolut froze my funds", "cheapest way to transfer", 
+    "Wise froze my funds", "Wise account closed", "Revolut froze my funds", "cheapest way to transfer", "$500k",
             "better rate than",
     "Revolut business account blocked", "Mollie froze my funds",
     "payment processor froze my funds", "payment processor held my funds",
