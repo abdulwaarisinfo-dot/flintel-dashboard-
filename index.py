@@ -190,7 +190,7 @@ INDUSTRIES = {
             "payment", "payments", "payment gateway", "payment processor", "payment processing", "transfer pending", "£10k", "£10,000",
             "payment infrastructure", "payment platform", "payment provider", "payment rails",  
             "remittance", "remittances", "remit money", "forex", "fx trading", "fx rate", "transfer failed", "one million", "$1m",
-            "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer", "looking for a transfer",
+            "fx hedging", "wire transfer", "swift transfer", "ach transfer", "sepa transfer", "looking for a transfer", "$1 million",
             "iban", "swift", "stripe", "paypal", "wise transfer", "revolut", "adyen", "plaid",
             "square payments", "venmo", "cash app", "zelle", "banking", "bank transfer", "transfer stuck",
             "online banking", "digital bank", "neobank", "challenger bank", "open banking",
